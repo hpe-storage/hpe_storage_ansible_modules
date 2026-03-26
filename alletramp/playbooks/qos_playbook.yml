@@ -1,0 +1,53 @@
+- hosts: localhost
+  tasks:
+    - name: Load Storage System Vars
+      include_vars: 'properties/storage_system_properties.yml'
+ 
+    - name: Load Qos Vars
+      include_vars: 'properties/qos_properties.yml'
+ 
+    - name: Create QoS
+      alletramp_qos:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: create_qos
+        targetName: "{{targetName}}"
+        iopsMaxLimit: "{{ iopsMaxLimit }}"
+        bandwidthMaxLimitKiB: "{{ bandwidthMaxLimitKiB }}"
+        enable: true
+        targetType: "QOS_TGT_VVSET"
+ 
+    - name: Modify QoS "{{ qos_name }}"
+      alletramp_qos:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: modify_qos
+        targetName: "{{targetName}}"
+        bandwidthMaxLimitKiB: "{{ bandwidthMaxLimitKiB }}"
+        iopsMaxLimit: 1026
+        enable: true
+ 
+    - name: Get QoS "{{ qos_name }}"
+      alletramp_qos:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: get_qos
+        targetName: "{{targetName}}"
+ 
+    - name: Delete QoS "{{ qos_name }}"
+      alletramp_qos:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: delete_qos
+        targetName: "{{targetName}}"
+ 
+    - name: List QoS
+      alletramp_qos:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: list_qos

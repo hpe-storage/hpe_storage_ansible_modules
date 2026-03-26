@@ -1,0 +1,61 @@
+- hosts: localhost
+  tasks:
+  
+    - name: Load Storage System Vars
+      include_vars: 'properties/storage_system_properties.yml'
+      
+    - name: Load User Vars
+      include_vars: 'properties/user_properties.yml'
+      
+    - name: Create User "{{ test_user_name }}"
+      alletramp_user: 
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=create
+        name="{{ test_user_name }}"
+        password="{{ test_user_password }}"
+        domain_privileges="{{ test_user_domain_privileges }}"
+        
+    - name: Get User "{{ test_user_name }}" Information
+      alletramp_user: 
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=get
+        name="{{ test_user_name }}"
+      register: user_info
+      
+    - name: Modify User "{{ test_user_name }}" Domain Privileges
+      alletramp_user: 
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=modify
+        name="{{ test_user_name }}"
+        domain_privileges="{{ modified_user_domain_privileges }}"
+        
+    - name: Change User "{{ test_user_name }}" Password
+      alletramp_user: 
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=modify
+        name="{{ test_user_name }}"
+        current_password="{{ test_user_password }}"
+        new_password="{{ new_test_user_password }}"
+        
+    - name: Get All Users
+      alletramp_user: 
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=get_all
+        
+    - name: Delete User "{{ test_user_name }}"
+      alletramp_user: 
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=delete
+        name="{{ test_user_name }}"

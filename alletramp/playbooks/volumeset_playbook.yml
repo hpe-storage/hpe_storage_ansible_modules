@@ -1,0 +1,68 @@
+- hosts: localhost
+  tasks:
+  
+    - name: Load Storage System Vars
+      include_vars: 'properties/storage_system_properties.yml'
+      
+    - name: Load Volume Vars
+      include_vars: 'properties/volume_properties.yml'
+      
+    - name: Load Volume Vars
+      include_vars: 'properties/volumeset_properties.yml'
+      
+    - name: Create Volume "{{ volume_name }}"
+      alletramp_volume: 
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=create 
+        volume_name="{{ item }}"
+        cpg="{{ cpg }}"
+        size="{{ size }}"
+      with_items: "{{ ['volume_ansible_1', 'volume_ansible_2', 'volume_ansible_3'] }}"
+      
+    - 
+      alletramp_volumeset: 
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=create 
+        volumeset_name="{{ volumeset_name }}"
+        volumeset_type="{{ volumeset_type }}"
+        setmembers="{{ add_vol_setmembers }}"
+        
+    - name: Add volumes to Volumeset "{{ volumeset_name }}"
+      alletramp_volumeset: 
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=add_volumes 
+        volumeset_name="{{ volumeset_name }}"
+        setmembers="{{ add_vol_setmembers2 }}"
+        
+    - name: Remove volumes from Volumeset "{{ volumeset_name }}"
+      alletramp_volumeset: 
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=remove_volumes 
+        volumeset_name="{{ volumeset_name }}"
+        setmembers="{{ remove_vol_setmembers }}"
+     
+    - name: Delete Volumeset "{{ volumeset_name }}"
+      alletramp_volumeset: 
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=delete
+        volumeset_name="{{ volumeset_name }}"
+        
+    - name: Delete Volume "{{ volume_name }}"
+      alletramp_volume:
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=delete 
+        volume_name="{{ item }}"
+      with_items: "{{ ['volume_ansible_1', 'volume_ansible_2', 'volume_ansible_3'] }}"
+      

@@ -1,0 +1,13 @@
+dist: jammy
+sudo: false
+language: python
+python:
+    - "3.10"
+install: 
+  - sudo pip install ansible
+  - sudo pip install pytest
+  - sudo pip install mock
+
+script:
+  - export PYTHONPATH=$PWD:/usr/local/lib/python3.10/dist-packages:/usr/local/lib/python3.10/dist-packages
+  - python -m pytest

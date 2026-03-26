@@ -1,0 +1,73 @@
+- hosts: localhost
+  tasks:
+    - name: Load Demo Vars
+      include_vars: 'properties/storage_system_properties.yml'
+
+    - name: Load Volume Vars
+      include_vars: 'properties/volume_properties.yml'
+ 
+    - name: Create Volume my_ansible_base_volume
+      alletramp_volume: 
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: create
+        volume_name: "my_ansible_volume_check"
+        cpg: "{{ cpg }}"
+        size: 1024
+        size_unit: "MiB" 
+
+    - name: Create Volume snasphot my_ansible_snapshot
+      alletramp_snapshot: 
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: create
+        snapshot_name: "my_ansible_snapshot"
+        base_volume_name: "my_ansible_volume_check"
+        read_only: False
+
+    - name: Restore offline Volume snasphot my_ansible_snapshot
+      alletramp_snapshot: 
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: restore_offline
+        snapshot_name: "my_ansible_snapshot"
+        priority: "PRIORITYTYPE_MED"
+        
+    - name: Restore online Volume snasphot my_ansible_snapshot
+      alletramp_snapshot: 
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: restore_online
+        snapshot_name: "my_ansible_snapshot"
+
+
+    - name: Modify/rename snasphot my_ansible_snapshot to my_ansible_snapshot_renamed
+      alletramp_snapshot: 
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: modify
+        snapshot_name: "my_ansible_snapshot"
+        new_name: "my_ansible_snapshot_renamed"
+        
+
+        
+    - name: Delete snasphot my_ansible_snapshot_renamed
+      alletramp_snapshot: 
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: delete
+        snapshot_name: "my_ansible_snapshot_renamed"
+
+    - name: Delete Base volume my_ansible_base_volume
+      alletramp_volume: 
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: delete
+        volume_name: "my_ansible_volume_check"

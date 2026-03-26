@@ -1,0 +1,228 @@
+- hosts: localhost
+  tasks:
+  - name: Load Storage System Vars
+    include_vars: 'properties/storage_system_properties.yml'
+
+  - name: Load Volume Vars
+    include_vars: 'properties/volume_properties.yml'
+
+  - name: Create volume on source
+    alletramp_volume:
+      storage_system_ip: "{{ storage_system_ip }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      operation: create
+      volume_name: demo_ansiblevolume_1
+      size: 1024
+      size_unit: MiB
+      cpg: "{{ cpg }}"
+
+  - name: Create volume on source
+    alletramp_volume:
+      storage_system_ip: "{{ storage_system_ip }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      operation: create
+      volume_name: demo_ansiblevolume_2
+      size: 1024
+      size_unit: MiB
+      cpg: "{{ cpg }}"
+
+  - name: Create volume on target
+    alletramp_volume:
+      storage_system_ip: "{{ storage_system_ip2 }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      operation: create
+      volume_name: demo_ansiblevolume_1
+      size: 1024
+      size_unit: MiB
+      cpg: "{{ cpg }}"    
+
+  - name: Create volume on target
+    alletramp_volume:
+      storage_system_ip: "{{ storage_system_ip2 }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      operation: create
+      volume_name: demo_ansiblevolume_2
+      size: 1024
+      size_unit: MiB
+      cpg: "{{ cpg }}"         
+
+  - name: Create Remote Copy Group test_rcg
+    alletramp_remote_copy:
+      storage_system_ip: "{{ storage_system_ip }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      operation: create
+      remote_copy_group_name: test_rcg
+      remote_copy_targets:
+      - target_name: "{{ target_name }}"
+        target_mode: sync
+       
+  - name: Add volume to remote copy group
+    alletramp_remote_copy:
+      storage_system_ip: "{{ storage_system_ip }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      operation: add_volume
+      remote_copy_group_name: test_rcg
+      volume_name: demo_ansiblevolume_1
+      admit_volume_targets:
+      - target_name: "{{ target_name }}"
+        sec_volume_name: demo_ansiblevolume_1
+        
+  - name: Add volume to remote copy group
+    alletramp_remote_copy:
+      storage_system_ip: "{{ storage_system_ip }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      operation: add_volume
+      remote_copy_group_name: test_rcg
+      volume_name: demo_ansiblevolume_2
+      admit_volume_targets:
+      - target_name: "{{ target_name }}"
+        sec_volume_name: demo_ansiblevolume_2
+
+  - name: admit Remote Copy target
+    alletramp_remote_copy:
+      storage_system_ip: "{{ storage_system_ip }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      operation: admit_target
+      remote_copy_group_name: test_rcg
+      target_name: "{{ target_name }}"
+      local_remote_volume_pair_list:
+      - sourceVolumeName: demo_ansiblevolume_1
+        targetVolumeName: demo_ansiblevolume_1
+      - sourceVolumeName: demo_ansiblevolume_2
+        targetVolumeName: demo_ansiblevolume_2
+      target_mode: sync
+
+  - name: remote copy group status
+    alletramp_remote_copy:
+      storage_system_ip: "{{ storage_system_ip }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      operation: remote_copy_status
+      remote_copy_group_name: test_rcg
+    register: result
+
+  - debug:
+      msg: "{{ result.output.remote_copy_sync_status}}"
+
+
+  - name: dismiss Remote Copy target
+    alletramp_remote_copy:
+      storage_system_ip: "{{ storage_system_ip }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      operation: dismiss_target
+      remote_copy_group_name: test_rcg
+      target_name: "{{ target_name }}"
+
+  - name: Modify Remote Copy Group test_rcg
+    alletramp_remote_copy:
+      storage_system_ip: "{{ storage_system_ip }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      operation: modify
+      remote_copy_group_name: test_rcg
+      local_user_cpg: "{{ cpg }}"
+      local_snap_cpg: "{{ snap_cpg }}"
+      unset_user_cpg: false
+      unset_snap_cpg: false
+      modify_targets:
+      - target_name: "{{ target_name }}"
+        remote_user_cpg: "{{ cpg }}"
+        remote_snap_cpg: "{{ snap_cpg }}"
+        
+  - name: Start remote copy
+    alletramp_remote_copy:
+      storage_system_ip: "{{ storage_system_ip }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      remote_copy_group_name: test_rcg
+      operation: start
+      
+  - name: Stop remote copy
+    alletramp_remote_copy:
+      storage_system_ip: "{{ storage_system_ip }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      remote_copy_group_name: test_rcg
+      operation: stop
+      
+  - name: Remove volume from remote copy group
+    alletramp_remote_copy:
+      storage_system_ip: "{{ storage_system_ip }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      operation: remove_volume
+      remote_copy_group_name: test_rcg
+      volume_name: demo_ansiblevolume_1
+        
+  - name: Remove volume from remote copy group
+    alletramp_remote_copy:
+      storage_system_ip: "{{ storage_system_ip }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      operation: remove_volume
+      remote_copy_group_name: test_rcg
+      volume_name: demo_ansiblevolume_2
+        
+  - name: Remove Remote Copy Group test_rcg
+    alletramp_remote_copy:
+      storage_system_ip: "{{ storage_system_ip }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      operation: delete 
+      remote_copy_group_name: test_rcg
+
+  - name: dismiss remote copy link
+    alletramp_remote_copy:
+      storage_system_ip: "{{ storage_system_ip }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      operation: dismiss_link
+      target_name: "{{ target_name }}"
+      source_port: 0:3:1
+      target_port_wwn_or_ip: "{{ storage_system_ip2 }}"
+
+  - name: dismiss remote copy link
+    alletramp_remote_copy:
+      storage_system_ip: "{{ storage_system_ip }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      operation: dismiss_link
+      target_name: "{{ target_name }}"
+      source_port: "1:3:1"
+      target_port_wwn_or_ip: "{{ storage_system_ip2 }}"
+
+  - name: Admit remote copy link
+    alletramp_remote_copy:
+      storage_system_ip: "{{ storage_system_ip }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      operation: admit_link
+      target_name: "{{ target_name }}"
+      source_port: "{{ source_port_0 }}"
+      target_port_wwn_or_ip: "{{ target_wwn_0 }}"
+
+  - name: Admit remote copy link
+    alletramp_remote_copy:
+      storage_system_ip: "{{ storage_system_ip }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      operation: admit_link
+      target_name: "{{ target_name }}"
+      source_port: "{{ source_port_1 }}"
+      target_port_wwn_or_ip: "{{ target_wwn_1 }}"
+
+  - name: start remote copy service
+    alletramp_remote_copy:
+      storage_system_ip: "{{ storage_system_ip }}"
+      storage_system_password: "{{ storage_system_password }}"
+      storage_system_username: "{{ storage_system_username }}"
+      operation: start_rcopy

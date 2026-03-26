@@ -1,0 +1,3 @@
+targetName: "my_ansible_volumeset"
+iopsMaxLimit: 200
+bandwidthMaxLimitKiB: 10240

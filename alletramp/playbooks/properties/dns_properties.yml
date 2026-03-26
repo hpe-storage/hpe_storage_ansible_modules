@@ -1,0 +1,66 @@
+# Configuration Flags - Set to true to enable specific configurations
+configure_ipv4_network: true
+configure_ipv6_network: false
+configure_dual_stack: false
+configure_http_proxy: false
+configure_ntlm_proxy: false
+configure_minimal_dns: false
+
+# General Settings
+commit_network_changes: false  # Set to false for testing/staging
+
+# IPv4 Network Configuration
+ipv4_address: "x.x.x.x"
+ipv4_gateway: "x.x.x.x"
+ipv4_subnet_mask: "x.x.x.x"
+
+# IPv4 DNS Servers (up to 3 addresses)
+ipv4_dns_addresses:
+  - "x.x.x.x"
+  - "x.x.x.x"
+  - "x.x.x.x"
+
+# IPv6 Network Configuration
+ipv6_address: "x:x::x"
+ipv6_gateway: "x:x::x"
+ipv6_prefix_len: "x"
+ipv6_slaac_enable: true
+
+# IPv6 DNS Servers (up to 3 addresses)
+ipv6_dns_addresses:
+  - "x:x:x::x"
+  - "x:x:x::x"
+  - "x:x:x::x"
+
+# Dual Stack DNS (mixed IPv4 and IPv6)
+dual_stack_dns_addresses:
+  - "x.x.x.x"               # IPv4 DNS
+  - "x:x:x::x"  # IPv6 DNS
+  - "x.x.x.x"               # IPv4 DNS
+
+# HTTP Proxy Configuration
+http_proxy_server: "proxy.example.com"
+http_proxy_port: "port"
+proxy_auth_required: "enabled"
+proxy_username: "proxyuser"
+proxy_password: "proxypass"
+
+# DNS servers when using proxy
+dns_addresses_with_proxy:
+  - "x.x.x.x"
+  - "x.x.x.x"
+
+# NTLM Proxy Configuration (for Windows environments)
+ntlm_proxy_server: "ntlm-proxy.company.com"
+ntlm_proxy_port: "port"
+ntlm_proxy_username: "domain\\username"
+ntlm_proxy_password: "ntlmpass"
+ntlm_proxy_domain: "domain"
+
+# Minimal Configuration (for testing/basic setup)
+minimal_dns_addresses:
+  - "x.x.x.x"  # Single DNS server
+
+minimal_ipv4_address: "x.x.x.x"
+minimal_ipv4_gateway: "x.x.x.x"
+minimal_ipv4_subnet_mask: "x.x.x.x"

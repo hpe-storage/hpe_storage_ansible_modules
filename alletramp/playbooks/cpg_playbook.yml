@@ -1,0 +1,21 @@
+- hosts: localhost
+  tasks:
+    - name: Load Storage System Vars
+      include_vars: 'properties/storage_system_properties.yml'
+
+    - name: Create CPG ansible_auto_CreateCPG-001
+      alletramp_cpg:
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=create
+        cpg_name=ansible_auto_CreateCPG-001
+        growth_limit=2
+
+    - name: Delete CPG ansible_auto_CreateCPG-001
+      alletramp_cpg:
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=delete
+        cpg_name=ansible_auto_CreateCPG-001

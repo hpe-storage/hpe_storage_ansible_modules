@@ -1,0 +1,17 @@
+- hosts: localhost
+  tasks:
+    - name: Load Storage System Vars
+      include_vars: 'properties/storage_system_properties.yml'
+      
+    - name: Load NTP Vars
+      include_vars: 'properties/ntp_properties.yml'
+      
+    - name: Configure NTP and DateTime Settings
+      alletramp_ntp: 
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=configure_datetime
+        date_time="{{ date_time | default(omit) }}"
+        ntp_addresses="{{ ntp_addresses | default(omit) }}"
+        timezone="{{ timezone | default(omit) }}"

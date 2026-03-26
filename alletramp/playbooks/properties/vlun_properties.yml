@@ -1,0 +1,6 @@
+volume_name: "test-uthaya"
+volume_set_name: "set:qos_vvset24"
+host_name: "Test-Host-ISCSI-1"
+host_set_name: "set:test-host-set-uthaya"
+lun: 10
+autolun: False

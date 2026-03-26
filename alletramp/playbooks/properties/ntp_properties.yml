@@ -1,0 +1,10 @@
+# - Either date_time OR ntp_addresses must be provided (not both)
+
+# Example 1: Configure NTP servers (uncomment ntp_addresses, comment out date_time)
+ntp_addresses: "x.x.x.x"
+
+# Example 2: Set specific date/time (uncomment date_time, comment out ntp_addresses)
+#date_time: "MM/dd/yyyy HH:mm:ss"  # Format: MM/dd/yyyy HH:mm:ss
+
+# Timezone setting (REQUIRED)
+timezone: "Asia/Kolkata"

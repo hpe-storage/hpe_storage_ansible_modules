@@ -1,0 +1,93 @@
+- hosts: localhost
+  tasks:
+    - name: Load Storage System Vars
+      include_vars: 'properties/storage_system_properties.yml'
+      
+    - name: Load Vlun Vars
+      include_vars: 'properties/vlun_properties.yml'
+
+    - name: Export volume to host
+      alletramp_vlun:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: export_volume_to_host
+        volume_name: "{{ volume_name }}"
+        host_name: "{{ host_name }}"
+        lun: "{{ lun }}"
+        autolun: "{{ autolun }}"
+
+    - name: Unexport volume from host
+      alletramp_vlun:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: unexport_volume_from_host
+        volume_name: "{{ volume_name }}"
+        host_name: "{{ host_name }}"
+        lun: "{{ lun }}"
+
+
+    - name: Export volume to hostset
+      alletramp_vlun:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: export_volume_to_hostset
+        volume_name: "{{ volume_name }}"
+        host_set_name: "{{ host_set_name }}"
+        lun: "{{ lun }}"
+        autolun: "{{ autolun }}"
+
+    - name: Unexport volume from hostset
+      alletramp_vlun:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: unexport_volume_from_hostset
+        volume_name: "{{ volume_name }}"
+        host_set_name: "{{ host_set_name }}"
+        lun: "{{ lun }}"
+
+
+    - name: Export volumeset to host
+      alletramp_vlun:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: export_volumeset_to_host
+        volume_set_name: "{{ volume_set_name }}"
+        host_name: "{{ host_name }}"
+        lun: "{{ lun }}"
+        autolun: "{{ autolun }}"
+
+    - name: Unexport volumeset from host
+      alletramp_vlun:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: unexport_volumeset_from_host
+        volume_set_name: "{{ volume_set_name }}"
+        host_name: "{{ host_name }}"
+        lun: "{{ lun }}"
+
+    - name: Export volumeset to hostset
+      alletramp_vlun:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: export_volumeset_to_hostset
+        volume_set_name: "{{ volume_set_name }}"
+        host_set_name: "{{ host_set_name }}"
+        lun: "{{ lun }}"
+        autolun: "{{ autolun }}"
+
+    - name: Unexport volumeset from hostset
+      alletramp_vlun:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: unexport_volumeset_from_hostset
+        volume_set_name: "{{ volume_set_name }}"
+        host_set_name: "{{ host_set_name }}"
+        lun: "{{ lun }}"

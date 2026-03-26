@@ -1,0 +1,106 @@
+- name: DNS and Network Configuration for HPE Alletra MP Storage
+  hosts: localhost
+  gather_facts: no
+  
+  tasks:
+    - name: Load Storage System Vars
+      include_vars: 'properties/storage_system_properties.yml'
+      
+    - name: Load DNS Vars
+      include_vars: 'properties/dns_properties.yml'
+  
+    - name: Configure IPv4 network with DNS servers
+      alletramp_dns:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: configure_network
+        dns_addresses: "{{ ipv4_dns_addresses }}"
+        ipv4_address: "{{ ipv4_address }}"
+        ipv4_gateway: "{{ ipv4_gateway }}"
+        ipv4_subnet_mask: "{{ ipv4_subnet_mask }}"
+        commit_change: "{{ commit_network_changes }}"
+      when: configure_ipv4_network | default(false)
+      
+    - name: Configure IPv6 network with DNS servers
+      alletramp_dns:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: configure_network
+        dns_addresses: "{{ ipv6_dns_addresses }}"
+        ipv6_address: "{{ ipv6_address }}"
+        ipv6_gateway: "{{ ipv6_gateway }}"
+        ipv6_prefix_len: "{{ ipv6_prefix_len }}"
+        slaac_enable: "{{ ipv6_slaac_enable }}"
+        commit_change: "{{ commit_network_changes }}"
+      when: configure_ipv6_network | default(false)
+      
+    - name: Configure dual-stack network (IPv4 + IPv6)
+      alletramp_dns:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: configure_network
+        dns_addresses: "{{ dual_stack_dns_addresses }}"
+        ipv4_address: "{{ ipv4_address }}"
+        ipv4_gateway: "{{ ipv4_gateway }}"
+        ipv4_subnet_mask: "{{ ipv4_subnet_mask }}"
+        ipv6_address: "{{ ipv6_address }}"
+        ipv6_gateway: "{{ ipv6_gateway }}"
+        ipv6_prefix_len: "{{ ipv6_prefix_len }}"
+        slaac_enable: "{{ ipv6_slaac_enable }}"
+        commit_change: "{{ commit_network_changes }}"
+      when: configure_dual_stack | default(false)
+      
+    - name: Configure network with HTTP proxy
+      alletramp_dns:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: configure_network
+        dns_addresses: "{{ dns_addresses_with_proxy }}"
+        ipv4_address: "{{ ipv4_address }}"
+        ipv4_gateway: "{{ ipv4_gateway }}"
+        ipv4_subnet_mask: "{{ ipv4_subnet_mask }}"
+        proxy_server: "{{ http_proxy_server }}"
+        proxy_port: "{{ http_proxy_port }}"
+        proxy_protocol: "HTTP"
+        proxy_authentication_required: "{{ proxy_auth_required }}"
+        proxy_user: "{{ proxy_username }}"
+        proxy_password: "{{ proxy_password }}"
+        commit_change: "{{ commit_network_changes }}"
+      when: configure_http_proxy | default(false)
+      
+    - name: Configure network with NTLM proxy
+      alletramp_dns:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: configure_network
+        dns_addresses: "{{ dns_addresses_with_proxy }}"
+        ipv4_address: "{{ ipv4_address }}"
+        ipv4_gateway: "{{ ipv4_gateway }}"
+        ipv4_subnet_mask: "{{ ipv4_subnet_mask }}"
+        proxy_server: "{{ ntlm_proxy_server }}"
+        proxy_port: "{{ ntlm_proxy_port }}"
+        proxy_protocol: "NTLM"
+        proxy_authentication_required: "enabled"
+        proxy_user: "{{ ntlm_proxy_username }}"
+        proxy_password: "{{ ntlm_proxy_password }}"
+        proxy_user_domain: "{{ ntlm_proxy_domain }}"
+        commit_change: "{{ commit_network_changes }}"
+      when: configure_ntlm_proxy | default(false)
+      
+    - name: Configure minimal DNS settings (IPv4 only)
+      alletramp_dns:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: configure_network
+        dns_addresses: "{{ minimal_dns_addresses }}"
+        ipv4_address: "{{ minimal_ipv4_address }}"
+        ipv4_gateway: "{{ minimal_ipv4_gateway }}"
+        ipv4_subnet_mask: "{{ minimal_ipv4_subnet_mask }}"
+        commit_change: false  # Don't commit for minimal config
+      when: configure_minimal_dns | default(false)

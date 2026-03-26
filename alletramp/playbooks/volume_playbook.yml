@@ -1,0 +1,57 @@
+- hosts: localhost
+  tasks:
+  
+    - name: Load Storage System Vars
+      include_vars: 'properties/storage_system_properties.yml'
+      
+    - name: Load Volume Vars
+      include_vars: 'properties/volume_properties.yml'
+      
+    - name: Load Host Vars
+      include_vars: 'properties/host_properties.yml'
+
+    - name: Create Volume "{{ volume_name }}"
+      alletramp_volume: 
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=create 
+        volume_name="{{ volume_name }}"
+        cpg="{{ cpg }}"
+        size="{{ size }}"
+        
+    - name: Tune Volume "{{ volume_name }} "
+      alletramp_volume: 
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=tune 
+        volume_name="{{ volume_name }}"
+        type="CONVERSIONTYPE_V2"
+        cpg="{{ cpg }}"
+
+    - name: Grow Volume "{{ volume_name }}"
+      alletramp_volume: 
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=grow 
+        volume_name="{{ volume_name }}"
+        growth_size_mib=18000
+
+    - name: Rename Volume "{{ volume_name }} to {{ new_name }}"
+      alletramp_volume: 
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=modify
+        volume_name="{{volume_name}}"
+        new_name="{{ new_name }}"
+
+    - name: Delete Volume "{{ new_name }}"
+      alletramp_volume:
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=delete 
+        volume_name="{{new_name}}"
