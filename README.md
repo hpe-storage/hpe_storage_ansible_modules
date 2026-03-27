@@ -74,7 +74,7 @@ The following actions are non-idempotent:
 | Component | Version | Status |
 |-----------|---------|--------|
 | **HPE Alletra MP** | OS 10.5.x with WSAPI service enabled | ✅ Required |
-| **Ansible** | 2.9, 2.10, 2.11 | ✅ Supported |
+| **Ansible** | 2.17.4 | ✅ Supported |
 | **Python** | 3.10 + | ✅ Required |
 
 **Prerequisites:**
@@ -87,7 +87,7 @@ The following actions are non-idempotent:
 
 | Package | Version |
 |---------|---------|
-| **hpe_storage_flowkit_py** | 1.0 |
+| **hpe_storage_flowkit_py** | 0.6 |
 
 **Installation:**
 
@@ -108,9 +108,10 @@ Refer to [System Requirements](#system-requirements) for detailed platform compa
 
 ## 1. Install Python Dependencies
 
-Install the required HPE Storage Flowkit python package:
+Install Ansible and the required HPE Storage Flowkit python package:
 
 ```bash
+pip install ansible
 pip install hpe-storage-flowkit-py
 ```
 ---
@@ -156,9 +157,10 @@ cd hpe_storage_ansible_modules
 
 **Repository Contents:**
 
-- `modules/` - Ansible modules for HPE Alletra MP
-- `playbooks/` - Example playbooks and templates
-- `ansible.cfg` - Sample Ansible configuration
+- `alletramp/` - Main module directory for AlletraMP
+  - `modules/` - Ansible modules for HPE Alletra MP
+  - `playbooks/` - Example playbooks and templates
+  - `ansible.cfg` - Sample Ansible configuration
 
 ---
 
@@ -167,7 +169,7 @@ cd hpe_storage_ansible_modules
 Set up the required environment variables:
 
 ```bash
-export ANSIBLE_CONFIG="/path/to/your/hpe_storage_ansible_modules/ansible.cfg"
+export ANSIBLE_CONFIG="/path/to/your/hpe_storage_ansible_modules/alletramp/ansible.cfg"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
@@ -178,7 +180,7 @@ export PATH="$HOME/.local/bin:$PATH"
 Edit the `ansible.cfg` file in your project root directory to specify the module library path:
 
 ```ini
-library = /path/to/your/hpe_storage_ansible_modules/modules
+library = /path/to/your/hpe_storage_ansible_modules/alletramp/modules
 ```
 
 **Example with Absolute Path:**
@@ -208,7 +210,7 @@ Create a simple test playbook to verify your setup.
 
 # Running Unit Tests
 
-This section explains how to run the unit tests for the HPE Storage Ansible Module and generate coverage reports.
+This section explains how to run the unit tests for the HPE Storage Ansible Module.
 
 ## Prerequisites
 
@@ -247,7 +249,9 @@ python3 -m pytest test/test_alletramp_volume.py::TestAlletrampVolume::test_creat
 cd /path/to/hpe_storage_ansible_modules/alletramp
 python3 -m pytest
 ```
-Note: Python Path should set to hpe_storage_ansible_modules/alletramp for running test files 
+
+**Note:** Python Path should be set to `hpe_storage_ansible_modules/alletramp` for running test files.
+
 ---
 
 # Getting Started
@@ -258,9 +262,9 @@ This guide provides quick examples to help you start using the HPE Storage Ansib
 
 Before you begin, ensure you have:
 
-- ✅ Ansible installed (2.9 or later)
+- ✅ Ansible installed (2.17.4)
 - ✅ Python 3.10 or later
-- ✅ HPE Storage Ansible Module is installed
+- ✅ HPE Storage Ansible Module is cloned
 - ✅ Python dependencies installed (`hpe_storage_flowkit_py`)
 - ✅ Connectivity to your Alletra MP array
 - ✅ Valid credentials with appropriate privileges
