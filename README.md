@@ -1,4 +1,4 @@
-# HPE Storage Ansible Module
+# HPE Storage Ansible Modules
 
 Welcome to the documentation for HPE Storage Ansible Module.
 
