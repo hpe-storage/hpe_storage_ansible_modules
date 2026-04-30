@@ -17,8 +17,8 @@
 #
 from ansible.module_utils.basic import AnsibleModule
 try:
-    from hpe_storage_flowkit_py.services.src.ansible_service import AnsibleClient
-except:
+    from ansible_service import AnsibleClient
+except ImportError:
     AnsibleClient = None
 
 
@@ -70,7 +70,7 @@ def main():
 
 
     if AnsibleClient is None:
-        module.fail_json(msg="Python hpe_storage_flowkit_py package is required.")
+        module.fail_json(msg="Failed to import AnsibleClient from ansible_service.")
     flowkit_client = AnsibleClient(storage_system_ip, storage_system_username, storage_system_password)
 
     # Dispatch operations (functions exit/fail directly)

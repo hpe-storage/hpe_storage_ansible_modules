@@ -117,8 +117,8 @@ from ansible.module_utils.basic import AnsibleModule
 
 # Import HPE Storage Ansible Client for interacting with Alletra MP storage systems
 try:
-    from hpe_storage_flowkit_py.services.src.ansible_service import AnsibleClient
-except:
+    from ansible_service import AnsibleClient
+except ImportError:
     AnsibleClient = None
 
 
@@ -140,7 +140,7 @@ def main():
 
     # Verify that the required HPE Storage client library is available
     if AnsibleClient is None:
-        module.fail_json(msg='Python hpe_storage_flowkit_py package is required.')
+        module.fail_json(msg='Failed to import AnsibleClient from ansible_service.')
 
     # Extract module parameters
     storage_system_ip = module.params['storage_system_ip']

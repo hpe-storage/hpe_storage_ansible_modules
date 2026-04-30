@@ -87,7 +87,7 @@ The following actions are non-idempotent:
 
 | Package | Version |
 |---------|---------|
-| **hpe_storage_flowkit_py** | 0.6 |
+| **hpe_storage_flowkit_py** | 0.8 |
 
 **Installation:**
 
@@ -121,7 +121,7 @@ pip install hpe-storage-flowkit-py
 Test that the packages were installed correctly:
 
 ```bash
-python3 -c "from hpe_storage_flowkit_py.services.src.ansible_service import AnsibleClient; print('✓ HPE Storage Flowkit installed successfully')"
+python3 -c "import hpe_storage_flowkit_py; print('✓ HPE Storage Flowkit installed successfully')"
 ```
 
 **Expected Outcomes:**
@@ -158,6 +158,7 @@ cd hpe_storage_ansible_modules
 **Repository Contents:**
 
 - `alletramp/` - Main module directory for AlletraMP
+  - `ansible_service.py` - Ansible client that interfaces with hpe_storage_flowkit_py
   - `modules/` - Ansible modules for HPE Alletra MP
   - `playbooks/` - Example playbooks and templates
   - `ansible.cfg` - Sample Ansible configuration
@@ -169,6 +170,7 @@ cd hpe_storage_ansible_modules
 Set up the required environment variables:
 
 ```bash
+export PYTHONPATH="/path/to/your/hpe_storage_ansible_modules/alletramp:$PYTHONPATH"
 export ANSIBLE_CONFIG="/path/to/your/hpe_storage_ansible_modules/alletramp/ansible.cfg"
 export PATH="$HOME/.local/bin:$PATH"
 ```
