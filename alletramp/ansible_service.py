@@ -28,7 +28,6 @@ required operations are available in the v3 API endpoint.
 # Import v3 Flowkit modules for most workflows
 from hpe_storage_flowkit_py.v3.src.core import exceptions
 from hpe_storage_flowkit_py.v3.src.core.session import SessionManager as SessionManagerV3
-from hpe_storage_flowkit_py.v3.src.core.logger import Logger
 from hpe_storage_flowkit_py.v3.src.workflows.volumeset import VolumeSetWorkflow
 from hpe_storage_flowkit_py.v3.src.workflows.cpg import CpgWorkflow
 from hpe_storage_flowkit_py.v3.src.workflows.volume import VolumeWorkflow
@@ -57,6 +56,20 @@ from hpe_storage_flowkit_py.v1.src.workflows.vlun import VLUNWorkflow
 from hpe_storage_flowkit_py.v1.src.utils.vlun_utils import find_vlun, build_payload
 from hpe_storage_flowkit_py.v1.src.validators.vlun_validator import validate_params
 
+import logging
+
+LOG_FILE = 'ansible_service.log'
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, encoding='utf-8'),
+    ],
+    force=True,
+)
+
 class AnsibleClient:
     # API version constants
     API_VERSION_V1 = "v1"
@@ -80,7 +93,7 @@ class AnsibleClient:
         """
 
         # Initialize logger
-        self.logger = Logger(name='ansible_client', log_file=log_file)
+        self.logger = logging.getLogger(__name__)
         self.logger.info("Initializing AnsibleClient ")
 
         # Construct API URLs for both v3 and v1 endpoints
