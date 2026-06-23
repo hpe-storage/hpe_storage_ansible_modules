@@ -19,6 +19,35 @@
         volume_name="{{ volume_name }}"
         cpg="{{ cpg }}"
         size="{{ size }}"
+
+    - name: Create Volume with ransomware protection "{{ volume_name }}_ransomware"
+      alletramp_volume:
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=create
+        volume_name="{{ volume_name }}_ransomware"
+        cpg="{{ cpg }}"
+        size="{{ size }}"
+        ransomWare=true
+
+    - name: Enable ransomware protection on existing Volume "{{ volume_name }}"
+      alletramp_volume:
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=modify
+        volume_name="{{ volume_name }}"
+        ransomWare=true
+
+    - name: Disable ransomware protection on existing Volume "{{ volume_name }}"
+      alletramp_volume:
+        storage_system_ip="{{ storage_system_ip }}"
+        storage_system_username="{{ storage_system_username }}"
+        storage_system_password="{{ storage_system_password }}"
+        operation=modify
+        volume_name="{{ volume_name }}"
+        ransomWare=false
         
     - name: Tune Volume "{{ volume_name }} "
       alletramp_volume: 
