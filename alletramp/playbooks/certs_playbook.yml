@@ -1,0 +1,84 @@
+- hosts: localhost
+  tasks:
+  
+    - name: Load Storage System Vars
+      include_vars: 'properties/storage_system_properties.yml'
+      
+    - name: Load Certificates Vars
+      include_vars: 'properties/certs_properties.yml'
+      
+    - name: Get All Certificates
+      alletramp_certs: 
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: get_all
+      register: all_certificates
+        
+    - name: Get Certificate by Name
+      alletramp_certs: 
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: get
+        cert_name: "{{ test_cert_name }}"
+      register: certificate_details
+      ignore_errors: yes
+      
+    - name: Create Certificate for Service "{{ test_cert_service }}" (type:{{ test_cert_type }})
+      alletramp_certs: 
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: create
+        cert_type: "{{ test_cert_type }}"
+        service: "{{ test_cert_service }}"
+        common_name: "{{ test_cert_common_name }}"
+        days: "{{ test_cert_days }}"
+        key_length: "{{ test_cert_key_length }}"
+        subject_alt: "{{ test_cert_subject_alt }}"
+        organization_unit: "{{ test_cert_org_unit }}"
+        organization: "{{ test_cert_organization }}"
+        locality: "{{ test_cert_locality }}"
+        province: "{{ test_cert_province }}"
+        country: "{{ test_cert_country }}"
+      register: create_result
+      ignore_errors: yes
+      when: test_cert_type in ['selfsigned', 'csr']
+
+    - name: Import Certificate for Service "{{ test_cert_service }}"
+      alletramp_certs: 
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: create
+        cert_type: "{{ test_cert_type }}"
+        service: "{{ test_cert_service }}"
+        authority_chain: "{{ test_authority_chain }}"
+        certificate: "{{ test_certificate }}"
+      register: import_result
+      ignore_errors: yes
+      when: test_cert_type == 'import'
+
+    - name: Finish CSR Certificate with Signed Certificate (Patch Operation) 
+      alletramp_certs: 
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: patch
+        cert_name: "{{ test_cert_name }}"
+        authority_chain: "{{ test_authority_chain }}"
+        certificate: "{{ test_certificate }}"
+      register: patch_csr_result
+      ignore_errors: yes
+      when: test_cert_type == 'csr'
+        
+    - name: Delete Test Certificate
+      alletramp_certs: 
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: delete
+        cert_name: "{{ test_cert_name }}"
+      register: delete_result
+      ignore_errors: yes

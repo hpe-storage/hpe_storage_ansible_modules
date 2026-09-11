@@ -1,0 +1,32 @@
+# Alert Management Properties for HPE Alletra MP
+
+# Configuration Flags - Set to true to enable specific operations
+get_all_alerts: true
+get_filtered_alerts: false
+generate_test_alert: false
+
+# Filter parameters for get operation
+# Uncomment and set the filters you want to apply
+
+# Filter by alert type
+# Valid values: TYPE_UNKNOWN, TYPE_CUSTOMER, TYPE_SERVICE, TYPE_APPLICATION
+# filter_alert_type: "TYPE_CUSTOMER"
+
+# Filter by event severity
+# Valid values: SEVERITY_UNKNOWN, SEVERITY_FATAL, SEVERITY_CRITICAL,
+#               SEVERITY_MAJOR, SEVERITY_MINOR, SEVERITY_DEGRADED,
+#               SEVERITY_INFO, SEVERITY_DEBUG
+# filter_severity: "SEVERITY_CRITICAL"
+
+# Filter by alert status
+# Valid values: STATUS_UNKNOWN, STATUS_NEW, STATUS_ACKNOWLEDGED,
+#               STATUS_FIXED, STATUS_REMOVED, STATUS_AUTOFIXED
+# filter_alert_status: "STATUS_NEW"
+
+# Filter by time - show alerts from last N days or N hours
+# Use only one of these at a time
+# filter_last_days: 2
+# filter_last_hours: 1
+
+# Test alert message
+test_alert_message: "Test alert generated from Ansible playbook"

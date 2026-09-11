@@ -1,0 +1,25 @@
+# Certificate Management Properties for HPE Alletra MP
+
+# Test certificate properties 
+test_cert_type: "Type"
+test_cert_service: "Service"  
+test_cert_name: "Certificate_name"  
+test_cert_key_length: 2048  # Mandatory for selfsigned certificates. Valid: 2048, 3072, 4096
+test_cert_common_name: "Common_name"
+test_cert_subject_alt: "Alternate_name"
+test_cert_org_unit: "Test Unit"
+test_cert_organization: "Test Company"
+test_cert_days: 1095  # Valid range: 1-3650 days, defaults to 1095 (3 years)  
+test_cert_locality: "Test City"
+test_cert_province: "Test State"
+test_cert_country: "Test Country"
+
+# Certificate and authority chain for import and patch (CSR finish) operations
+# test_authority_chain: |
+#   -----BEGIN CERTIFICATE-----
+#   ... (CA certificate PEM) ...
+#   -----END CERTIFICATE-----
+# test_certificate: |
+#   -----BEGIN CERTIFICATE-----
+#   ... (Server certificate PEM) ...
+#   -----END CERTIFICATE-----

@@ -46,6 +46,7 @@
       schedule_name: my_ansible_sc
       new_schedule_name: ansible_sc
       minute: "40"
+      year: "*"
 
 
   - name: Suspend Schedule on source

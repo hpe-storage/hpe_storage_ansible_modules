@@ -1,4 +1,4 @@
-# HPE Storage Ansible Modules
+# HPE Storage Ansible Module
 
 Welcome to the documentation for HPE Storage Ansible Module.
 
@@ -47,6 +47,8 @@ The collection provides modules to automate complete storage lifecycle managemen
 - Replication Copy Group operations
 - Performance optimization with QoS policies
 - System Management - DNS, NTP and user accounts.
+- SSL/TLS certificate management
+- Alert monitoring and test alert generation
 
 **Key Benefits:**
 
@@ -64,6 +66,7 @@ The following actions are non-idempotent:
 - **Snapshot**: restore online, restore offline
 - **Virtual Volume**: grow
 - **VLUN**: All actions become non-idempotent when autolun is set to true
+- **Alert**: test_alert
 
 ---
 
@@ -324,6 +327,8 @@ This section provides an overview of all modules available in the HPE Storage An
 
 | **Module** | **Description** |
 |-----------|-----------------|
+| [`alletramp_alert`](alletramp/modules/readme.md#alletramp_alert) | Queries alerts and generates test alerts |
+| [`alletramp_certs`](alletramp/modules/readme.md#alletramp_certs) | Manages SSL/TLS certificates for array services |
 | [`alletramp_cpg`](alletramp/modules/readme.md#alletramp_cpg) | Manages Common Provisioning Group (storage pool) operations |
 | [`alletramp_dns`](alletramp/modules/readme.md#alletramp_dns) | Manages DNS configuration and network settings |
 | [`alletramp_host`](alletramp/modules/readme.md#alletramp_host) | Manages host operations with FC/iSCSI initiators and CHAP authentication |

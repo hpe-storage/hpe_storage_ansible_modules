@@ -71,3 +71,4 @@
         storage_system_password: "{{ storage_system_password }}"
         operation: delete
         volume_name: "my_ansible_volume_check"
+        cascade: true

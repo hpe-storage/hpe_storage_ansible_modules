@@ -1,0 +1,41 @@
+- name: Alert Management for HPE Alletra MP Storage
+  hosts: localhost
+  gather_facts: no
+  
+
+  tasks:
+    - name: Load Storage System Vars
+      include_vars: 'properties/storage_system_properties.yml'
+
+    - name: Load Alert Vars
+      include_vars: 'properties/alert_properties.yml'
+
+    - name: Get All Alerts
+      alletramp_alert:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: get
+      when: get_all_alerts | default(false)
+
+    - name: Get Filtered Alerts
+      alletramp_alert:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: get
+        alert_type: "{{ filter_alert_type | default(omit) }}"
+        severity: "{{ filter_severity | default(omit) }}"
+        alert_status: "{{ filter_alert_status | default(omit) }}"
+        last_days: "{{ filter_last_days | default(omit) }}"
+        last_hours: "{{ filter_last_hours | default(omit) }}"
+      when: get_filtered_alerts | default(false)
+
+    - name: Generate Test Alert
+      alletramp_alert:
+        storage_system_ip: "{{ storage_system_ip }}"
+        storage_system_username: "{{ storage_system_username }}"
+        storage_system_password: "{{ storage_system_password }}"
+        operation: test_alert
+        test_message: "{{ test_alert_message | default(omit) }}"
+      when: generate_test_alert | default(false)
