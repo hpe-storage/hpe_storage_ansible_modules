@@ -175,6 +175,13 @@ options:
       - "Name of the Virtual Volume."
     required: true
     type: str
+  cascade:
+    description:
+      - "If true, automatically delete all child snapshots and clones before deleting the volume."
+      - "Used with delete operation to handle volumes that have dependent snapshots."
+    default: true
+    required: false
+    type: bool
   wwn:
     description:
       - "World Wide Name (WWN) of the volume."
@@ -375,6 +382,10 @@ def main():
         },
         "saveToNewName":{
            "type":"str"
+        },
+        "cascade":{
+           "type":"bool",
+           "default": True
         }
         
     }
@@ -438,7 +449,8 @@ def main():
           return_status, changed, msg, issue_attr_dict = flowkit_client.create_volume(volume_name, cpg, size, **payload)  
 
       elif module.params["operation"] == "delete":
-          return_status,changed,msg,issue_attr_dict= flowkit_client.delete_volume(name=volume_name)
+          cascade = module.params.get("cascade", True)
+          return_status,changed,msg,issue_attr_dict= flowkit_client.delete_volume(name=volume_name, cascade=cascade)
 
       elif module.params["operation"] == "grow":
           return_status,changed,msg,issue_attr_dict=flowkit_client.grow_volume(volume_name,growth_size_mib)

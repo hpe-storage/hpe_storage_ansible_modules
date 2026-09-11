@@ -23,20 +23,334 @@ This document provides comprehensive documentation for HPE Storage Ansible modul
 
 ## Table of Contents
 
-1. [alletramp_cpg](#alletramp_cpg) - Common Provisioning Groups
-2. [alletramp_dns](#alletramp_dns) - DNS and Network Configuration
-3. [alletramp_host](#alletramp_host) - Host Management
-4. [alletramp_hostset](#alletramp_hostset) - Host Set Management
-5. [alletramp_ntp](#alletramp_ntp) - NTP and Date/Time Configuration
-6. [alletramp_offline_clone](#alletramp_offline_clone) - Offline Clone Management
-7. [alletramp_online_clone](#alletramp_online_clone) - Online Clone Management
-8. [alletramp_qos](#alletramp_qos) - Quality of Service Management
-9. [alletramp_remote_copy](#alletramp_remote_copy) - Remote Copy Replication
-10. [alletramp_snapshot](#alletramp_snapshot) - Snapshot Management
-11. [alletramp_user](#alletramp_user) - User Account Management
-12. [alletramp_vlun](#alletramp_vlun) - VLUN Export Management
-13. [alletramp_volume](#alletramp_volume) - Volume Management
-14. [alletramp_volumeset](#alletramp_volumeset) - Volume Set Management
+1. [alletramp_alert](#alletramp_alert) - Alert Query and Management
+2. [alletramp_certs](#alletramp_certs) - Certificate Management
+3. [alletramp_cpg](#alletramp_cpg) - Common Provisioning Groups
+4. [alletramp_dns](#alletramp_dns) - DNS and Network Configuration
+5. [alletramp_host](#alletramp_host) - Host Management
+6. [alletramp_hostset](#alletramp_hostset) - Host Set Management
+7. [alletramp_ntp](#alletramp_ntp) - NTP and Date/Time Configuration
+8. [alletramp_offline_clone](#alletramp_offline_clone) - Offline Clone Management
+9. [alletramp_online_clone](#alletramp_online_clone) - Online Clone Management
+10. [alletramp_qos](#alletramp_qos) - Quality of Service Management
+11. [alletramp_remote_copy](#alletramp_remote_copy) - Remote Copy Replication
+12. [alletramp_snapshot](#alletramp_snapshot) - Snapshot Management
+13. [alletramp_user](#alletramp_user) - User Account Management
+14. [alletramp_vlun](#alletramp_vlun) - VLUN Export Management
+15. [alletramp_volume](#alletramp_volume) - Volume Management
+16. [alletramp_volumeset](#alletramp_volumeset) - Volume Set Management
+
+---
+
+# alletramp_alert
+
+Query and manage alerts on HPE Alletra MP storage arrays.
+
+**Supported Operations:**
+
+| Operation | Description |
+|-----------|-------------|
+| `get` | Retrieve alerts, optionally filtered by type, severity, status or time window |
+| `test_alert` | Generate a test alert on the storage array |
+
+---
+
+## Operation Methods
+
+### get
+
+Retrieve alerts from the storage array. Without any filter the operation returns all alerts. Filters can be combined to narrow down the result set.
+
+**Required Attributes**
+
+None - this operation lists all alerts when no filter is supplied.
+
+**Optional Attributes**
+
+| Parameter | Type | Default | Choices | Description |
+|-----------|------|---------|---------|-------------|
+| `alert_type` | str | - | `TYPE_UNKNOWN`, `TYPE_CUSTOMER`, `TYPE_SERVICE`, `TYPE_APPLICATION` | Filter alerts by alert type |
+| `severity` | str | - | `SEVERITY_UNKNOWN`, `SEVERITY_FATAL`, `SEVERITY_CRITICAL`, `SEVERITY_MAJOR`, `SEVERITY_MINOR`, `SEVERITY_DEGRADED`, `SEVERITY_INFO`, `SEVERITY_DEBUG` | Filter alerts by event severity |
+| `alert_status` | str | - | `STATUS_UNKNOWN`, `STATUS_NEW`, `STATUS_ACKNOWLEDGED`, `STATUS_FIXED`, `STATUS_REMOVED`, `STATUS_AUTOFIXED` | Filter alerts by alert status |
+| `last_days` | float | - | - | Show alerts raised in the last N days |
+| `last_hours` | float | - | - | Show alerts raised in the last N hours |
+
+**Note:** `last_days` and `last_hours` are mutually exclusive - only one of them can be used in a single task.
+
+---
+
+### test_alert
+
+Generate a test alert on the storage array to validate alert notification configuration.
+
+**Required Attributes**
+
+None.
+
+**Optional Attributes**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `test_message` | str | Message text to include in the generated test alert |
+
+---
+
+**Examples**
+
+```yaml
+- name: Get all alerts
+  alletramp_alert:
+    storage_system_ip: "10.10.10.100"
+    storage_system_username: "admin"
+    storage_system_password: "password"
+    operation: get
+```
+
+```yaml
+- name: Get critical customer alerts from last 2 days
+  alletramp_alert:
+    storage_system_ip: "10.10.10.100"
+    storage_system_username: "admin"
+    storage_system_password: "password"
+    operation: get
+    alert_type: "TYPE_CUSTOMER"
+    severity: "SEVERITY_CRITICAL"
+    last_days: 2
+```
+
+```yaml
+- name: Get new alerts from last 12 hours
+  alletramp_alert:
+    storage_system_ip: "10.10.10.100"
+    storage_system_username: "admin"
+    storage_system_password: "password"
+    operation: get
+    alert_status: "STATUS_NEW"
+    last_hours: 12
+```
+
+```yaml
+- name: Generate test alert
+  alletramp_alert:
+    storage_system_ip: "10.10.10.100"
+    storage_system_username: "admin"
+    storage_system_password: "password"
+    operation: test_alert
+    test_message: "Test alert from Ansible"
+```
+
+**Notes**
+
+- The `get` operation is read-only and always reports `changed: false`
+- Filters are additive - alerts must match every supplied filter to be returned
+- `test_alert` is non-idempotent, a new alert is raised on every run
+
+---
+
+# alletramp_certs
+
+Manage SSL/TLS certificates on HPE Alletra MP storage arrays.
+
+**Supported Operations:**
+
+| Operation | Description |
+|-----------|-------------|
+| `create` | Create a self-signed certificate, generate a CSR, or import a signed certificate |
+| `patch` | Complete a CSR by applying the signed certificate and authority chain |
+| `delete` | Delete an existing certificate by name |
+| `get` | Get details of a specific certificate |
+| `get_all` | Get details of all certificates configured on the array |
+
+---
+
+## Operation Methods
+
+### create
+
+Create a certificate for a storage array service. The `cert_type` determines which attributes are required.
+
+**Required Attributes**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `cert_type` | str | Type of certificate to create (`selfsigned`, `csr`, `import`) |
+| `service` | str | SSL service the certificate is created for |
+
+**Required by Certificate Type**
+
+| Certificate Type | Additional Required Attributes |
+|------------------|--------------------------------|
+| `selfsigned` | `common_name`, `key_length` |
+| `csr` | `common_name` |
+| `import` | `certificate`, `authority_chain` |
+
+**Optional Attributes**
+
+| Parameter | Type | Default | Choices | Description |
+|-----------|------|---------|---------|-------------|
+| `common_name` | str | - | - | Common name for the certificate |
+| `key_length` | int | 2048 | `2048`, `3072`, `4096` | Key length in bits (mandatory for self-signed certificates) |
+| `days` | int | 1095 | - | Validity period in days for self-signed certificates (1-3650) |
+| `country` | str | - | - | Country for the certificate subject |
+| `province` | str | - | - | Province or state for the certificate subject |
+| `locality` | str | - | - | Locality or city for the certificate subject |
+| `organization` | str | - | - | Organization for the certificate subject |
+| `organization_unit` | str | - | - | Organization unit for the certificate subject |
+| `subject_alt` | str | - | - | Subject Alternative Name (e.g. `DNS:TestArray,IP:10.1.1.10`) |
+| `certificate` | str | - | - | Certificate content in PEM format (for `import`) |
+| `authority_chain` | str | - | - | Authority chain in PEM format (for `import`) |
+
+**Supported `service` values:** `cim`, `cli`, `dscc`, `ekm-client`, `ekm-server`, `ldap`, `qw-client`, `qw-server`, `syslog-gen-client`, `syslog-gen-server`, `syslog-sec-client`, `syslog-sec-server`, `wsapi`, `unified-server`
+
+---
+
+### patch
+
+Complete a previously generated CSR by applying the certificate signed by the certificate authority.
+
+**Required Attributes**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `cert_name` | str | Name of the certificate to update |
+| `certificate` | str | Signed certificate content in PEM format |
+| `authority_chain` | str | Authority chain in PEM format |
+
+---
+
+### delete
+
+Delete an existing certificate from the storage array.
+
+**Required Attributes**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `cert_name` | str | Name of the certificate to delete |
+
+---
+
+### get
+
+Retrieve details of a specific certificate such as issuer, subject, fingerprint and signature type.
+
+**Required Attributes**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `cert_name` | str | Name of the certificate to retrieve |
+
+---
+
+### get_all
+
+List all certificates configured on the storage array.
+
+**Required Attributes**
+
+None - this operation lists all certificates.
+
+---
+
+**Examples**
+
+```yaml
+- name: Create self-signed certificate for unified-server service
+  alletramp_certs:
+    storage_system_ip: "10.10.10.100"
+    storage_system_username: "admin"
+    storage_system_password: "password"
+    operation: create
+    cert_type: "selfsigned"
+    service: "unified-server"
+    common_name: "TestArray"
+    key_length: 2048
+    days: 1095
+    subject_alt: "DNS:TestArray,IP:10.1.1.10"
+    organization_unit: "Unit"
+    organization: "My Company"
+    locality: "My City"
+    province: "Colorado"
+    country: "US"
+```
+
+```yaml
+- name: Create CSR certificate
+  alletramp_certs:
+    storage_system_ip: "10.10.10.100"
+    storage_system_username: "admin"
+    storage_system_password: "password"
+    operation: create
+    cert_type: "csr"
+    service: "wsapi"
+    common_name: "TestArray"
+    key_length: 2048
+    organization: "My Company"
+```
+
+```yaml
+- name: Import a signed certificate
+  alletramp_certs:
+    storage_system_ip: "10.10.10.100"
+    storage_system_username: "admin"
+    storage_system_password: "password"
+    operation: create
+    cert_type: "import"
+    service: "wsapi"
+    authority_chain: |
+      -----BEGIN CERTIFICATE-----
+      MIIBkTCB...
+      -----END CERTIFICATE-----
+    certificate: |
+      -----BEGIN CERTIFICATE-----
+      MIIDXTCCAkWg...
+      -----END CERTIFICATE-----
+```
+
+```yaml
+- name: Finish CSR by applying the signed certificate
+  alletramp_certs:
+    storage_system_ip: "10.10.10.100"
+    storage_system_username: "admin"
+    storage_system_password: "password"
+    operation: patch
+    cert_name: "TestArray"
+    authority_chain: |
+      -----BEGIN CERTIFICATE-----
+      MIIBkTCB...
+      -----END CERTIFICATE-----
+    certificate: |
+      -----BEGIN CERTIFICATE-----
+      MIIDXTCCAkWg...
+      -----END CERTIFICATE-----
+```
+
+```yaml
+- name: Get certificate information by name
+  alletramp_certs:
+    storage_system_ip: "10.10.10.100"
+    storage_system_username: "admin"
+    storage_system_password: "password"
+    operation: get
+    cert_name: "TestArray"
+  register: cert_info
+```
+
+```yaml
+- name: Get all certificates
+  alletramp_certs:
+    storage_system_ip: "10.10.10.100"
+    storage_system_username: "admin"
+    storage_system_password: "password"
+    operation: get_all
+```
+
+**Notes**
+
+- `key_length` is mandatory for self-signed certificates
+- A `csr` certificate is not active until it is completed with the `patch` operation
+- Replacing the certificate of a service such as `wsapi` or `unified-server` restarts that service connection, subsequent tasks may need to re-establish trust
+- `get` and `get_all` are read-only operations and always report `changed: false`
 
 ---
 
@@ -2355,13 +2669,28 @@ Create a new virtual volume with specified size allocation from a Common Provisi
 
 ### delete
 
-Delete an existing virtual volume from the storage array. The volume must not be exported to any hosts.
+Delete an existing virtual volume from the storage array.
 
 **Required Attributes**
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `volume_name` | str | Name of the volume to delete |
+
+**Optional Attributes**
+
+| Parameter | Type | Default | Choices | Description |
+|-----------|------|---------|---------|-------------|
+| `cascade` | bool | `true` | `true`, `false` | Delete the child volumes (snapshots and clones) of the volume before deleting the volume itself |
+
+**When to use `cascade`**
+
+| Value | Behaviour | Use when |
+|-------|-----------|----------|
+| `true` (default) | Child volumes are deleted depth-first, their VLUN exports and the exports of the volume itself are removed, and the volume is deleted last | The volume has child snapshots or clones that should be removed with it, for example decommissioning a base volume with its full snapshot tree |
+| `false` | Only the named volume is deleted and no exports are removed. The array rejects the delete if the volume still has dependent snapshots or active exports | The dependent snapshots or clones must be preserved |
+
+**Note:** `cascade: true` is irreversible, every snapshot and clone derived from the volume is deleted along with it. A completed offline clone is an independent volume and is not deleted.
 
 ---
 
@@ -2495,13 +2824,24 @@ Convert volume provisioning type or move volume to a different CPG. This operati
 ```
 
 ```yaml
-- name: Delete volume
+- name: Delete volume and all its child snapshots and clones (cascade defaults to true)
   alletramp_volume:
     storage_system_ip: "10.10.10.100"
     storage_system_username: "admin"
     storage_system_password: "password"
     operation: delete
     volume_name: "webapp_vol_001"
+```
+
+```yaml
+- name: Delete only the named volume, keeping child snapshots and clones
+  alletramp_volume:
+    storage_system_ip: "10.10.10.100"
+    storage_system_username: "admin"
+    storage_system_password: "password"
+    operation: delete
+    volume_name: "webapp_vol_001"
+    cascade: false
 ```
 
 **Notes**
@@ -2511,6 +2851,7 @@ Convert volume provisioning type or move volume to a different CPG. This operati
 - Tune operation can convert between thin and thick provisioning types
 - Volume names must be unique within the storage array
 - Data reduction and ransomware features may require specific array licensing
+- `cascade` defaults to `true` on delete, so child snapshots, clone volumes and their host exports are removed along with the volume, set `cascade: false` to limit the delete to the named volume
 
 ---
 

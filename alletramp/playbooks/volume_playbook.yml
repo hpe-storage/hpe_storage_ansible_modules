@@ -84,3 +84,4 @@
         storage_system_password="{{ storage_system_password }}"
         operation=delete 
         volume_name="{{new_name}}"
+        cascade=true

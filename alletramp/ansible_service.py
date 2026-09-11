@@ -40,6 +40,8 @@ from hpe_storage_flowkit_py.v3.src.workflows.ntp import NTPWorkflow
 from hpe_storage_flowkit_py.v3.src.workflows.dns import DNSWorkflow
 from hpe_storage_flowkit_py.v3.src.workflows.schedule import ScheduleWorkflow
 from hpe_storage_flowkit_py.v3.src.workflows.user import UserWorkflow
+from hpe_storage_flowkit_py.v3.src.workflows.certificate import CertificateWorkflow
+from hpe_storage_flowkit_py.v3.src.workflows.alert import AlertWorkflow
 
 # Import v1 Flowkit modules for remote copy operations only
 from hpe_storage_flowkit_py.v1.src.core.session import SessionManager as SessionManagerV1
@@ -129,6 +131,8 @@ class AnsibleClient:
         self.dns_workflow = DNSWorkflow(self.session_manager_v3, self.task_workflow)
         self.schedule_workflow=ScheduleWorkflow(self.session_manager_v3, self.task_workflow)
         self.user_workflow = UserWorkflow(self.session_manager_v3, self.task_workflow)
+        self.certificate_workflow = CertificateWorkflow(self.session_manager_v3, self.task_workflow)
+        self.alert_workflow = AlertWorkflow(self.session_manager_v3, self.task_workflow)
 
         # Initialize v1 workflows
         # Note: Host, VLUN, and Remote Copy Group operations use v1 API temporarily as these features
@@ -265,9 +269,72 @@ class AnsibleClient:
             self.logger.exception(f"AnsibleClient: Volume '{name}' creation failed: {e}")
             return (False, False, f"Volume {name} creation failed | {e}", {})
 
-    def delete_volume(self, name):
-        self.logger.info(f"AnsibleClient: Deleting volume '{name}'")
+    def _get_all_child_volumes(self, volume_name):
+        """Get all child volume names for a given parent volume using copyOfShortName filter."""
         try:
+            headers = {"experimentalfilter": "true"}
+            endpoint = f"/volumes?copyOfShortName={volume_name}"
+            self.logger.info(f"AnsibleClient: Querying children with endpoint={endpoint}")
+            response = self.session_manager_v3.rest_client.get(endpoint, headers=headers)
+            
+            # Normalize response
+            if isinstance(response, dict):
+                members = response.get('members', [])
+            else:
+                members = response if isinstance(response, list) else []
+
+            children = [vol.get('name') for vol in members if vol.get('name')]
+            self.logger.info(f"AnsibleClient: Children of '{volume_name}': {children}")
+            return children
+        except Exception as e:
+            self.logger.warning(f"AnsibleClient: Failed to get children for '{volume_name}': {e}")
+            return []
+
+    def _remove_volume_exports(self, volume_name):
+        """Remove all VLUN exports for a given volume so it can be deleted."""
+        try:
+            vluns = self.vlun_workflow.list_vluns()
+            for vlun in vluns:
+                if vlun.get('volumeName') == volume_name:
+                    lun = vlun.get('lun')
+                    hostname = vlun.get('hostname')
+                    port = vlun.get('portPos')
+                    self.logger.info(f"AnsibleClient: Removing export for volume '{volume_name}' "
+                                     f"(lun={lun}, host={hostname}, port={port})")
+                    # Build vlun_id in the format the API expects for DELETE
+                    vlun_id = f"{volume_name},{lun}"
+                    if hostname:
+                        vlun_id += f",{hostname}"
+                    try:
+                        self.vlun_workflow.unexport_volume_from_host(vlun_id)
+                        self.logger.info(f"AnsibleClient: Export removed for volume '{volume_name}' "
+                                         f"with vlun_id='{vlun_id}'")
+                    except Exception as vlun_err:
+                        self.logger.warning(f"AnsibleClient: Could not remove VLUN '{vlun_id}': {vlun_err}")
+        except Exception as e:
+            self.logger.warning(f"AnsibleClient: Failed to remove exports for '{volume_name}': {e}")
+
+    def _cascade_delete_children(self, volume_name):
+        """Recursively delete all child volumes (depth-first) before parent.
+        Also removes any exports (VLUNs) on each child before deletion."""
+        children = self._get_all_child_volumes(volume_name)
+        for child_name in children:
+            # Recurse: delete grandchildren first
+            self._cascade_delete_children(child_name)
+            # Remove exports before deleting
+            self._remove_volume_exports(child_name)
+            self.logger.info(f"AnsibleClient: Cascade deleting child volume '{child_name}'")
+            self.volume_workflow.delete_volume(child_name)
+            self.logger.info(f"AnsibleClient: Child volume '{child_name}' deleted successfully")
+
+    def delete_volume(self, name, cascade=False):
+        self.logger.info(f"AnsibleClient: Deleting volume '{name}' (cascade={cascade})")
+        try:
+            if cascade:
+                self._cascade_delete_children(name)
+                # Also remove exports from the parent volume itself
+                self._remove_volume_exports(name)
+
             resp = self.volume_workflow.delete_volume(name)
             self.logger.info(f"AnsibleClient: Volume '{name}' deleted successfully. Response: {resp}")
             return (True, True, f"Volume {name} deleted successfully", {})
@@ -860,6 +927,137 @@ class AnsibleClient:
             self.logger.error(f"AnsibleClient: User '{name}' deletion failed: {e}")
             return (False, False, f"User {name} deletion failed | {e}", {})
 
+    # Certificate related workflow operations
+    def get_all_certificates(self, **kwargs):
+        """Get all certificates (GET /api/v3/certificates)."""
+        self.logger.info("AnsibleClient: Getting all certificates")
+        try:
+            resp = self.certificate_workflow.get_all_certificates(**kwargs)
+            self.logger.info("AnsibleClient: All certificates retrieved successfully")
+            return (True, False, "All certificates retrieved successfully", {"response": resp})
+        except Exception as e:
+            self.logger.error(f"AnsibleClient: Failed to get all certificates: {e}")
+            return (False, False, f"Failed to get all certificates | {e}", {})
+
+    def create_certificate(self, cert_type, service, common_name=None, key_length=None, 
+                          days=None, country=None, province=None, locality=None,
+                          organization=None, organization_unit=None, subject_alt=None,
+                          authority_chain=None, certificate=None, **kwargs):
+        """Create a new certificate (POST /api/v3/certificates)."""
+        self.logger.info(f"AnsibleClient: Creating certificate for service '{service}', type '{cert_type}'")
+        try:
+            resp = self.certificate_workflow.create_certificate(
+                cert_type=cert_type, service=service, common_name=common_name,
+                key_length=key_length, days=days, country=country, province=province,
+                locality=locality, organization=organization, organization_unit=organization_unit,
+                subject_alt=subject_alt, authority_chain=authority_chain,
+                certificate=certificate, **kwargs
+            )
+            self.logger.info(f"AnsibleClient: Certificate for service '{service}' created successfully")
+
+            # Enhanced message for selfsigned certificates that cause service restarts
+            if cert_type == 'selfsigned':
+                enhanced_message = (
+                    f"Certificate for service {service} created successfully. "
+                    "NOTICE: Self-signed certificate created. "
+                    "Web Services API server and HPE Alletra Storage UI stopped successfully. "
+                    "The Web Services API server and HPE Alletra Storage UI will start shortly."
+                )
+                return (True, True, enhanced_message, {})
+            else:
+                return (True, True, f"Certificate for service {service} created successfully", {})
+        except Exception as e:
+            self.logger.error(f"AnsibleClient: Certificate creation failed: {e}")
+            return (False, False, f"Certificate creation failed | {e}", {})
+
+    def get_certificate_by_name(self, cert_name, **kwargs):
+        """Get certificate by certificate name."""
+        self.logger.info(f"AnsibleClient: Getting certificate with name '{cert_name}'")
+        try:
+            resp = self.certificate_workflow.get_certificate_by_name(cert_name, **kwargs)
+            self.logger.info(f"AnsibleClient: Certificate with name '{cert_name}' retrieved successfully")
+            return (True, False, f"Certificate with name {cert_name} retrieved successfully", {"response": resp})
+        except exceptions.CertificateDoesNotExist as dne:
+            self.logger.warning(f"AnsibleClient: Certificate with name '{cert_name}' does not exist")
+            return (True, False, str(dne), {})
+        except Exception as e:
+            self.logger.error(f"AnsibleClient: Failed to get certificate with name '{cert_name}': {e}")
+            return (False, False, f"Failed to get certificate with name {cert_name} | {e}", {})
+
+    def delete_certificate_by_name(self, cert_name, **kwargs):
+        """Delete certificate by certificate name."""
+        self.logger.info(f"AnsibleClient: Deleting certificate with name '{cert_name}'")
+        try:
+            resp = self.certificate_workflow.delete_certificate_by_name(cert_name, **kwargs)
+            self.logger.info(f"AnsibleClient: Certificate with name '{cert_name}' deleted successfully")
+
+            # Check if the workflow response indicates a service restart (selfsigned only)
+            if isinstance(resp, dict) and 'services restarting' in resp.get('status', ''):
+                enhanced_message = (
+                    f"Certificate with name {cert_name} deleted successfully. "
+                    "NOTICE: Certificates removed. "
+                    "Web Services API server and HPE Alletra Storage UI stopped successfully. "
+                    "The Web Services API server and HPE Alletra Storage UI will start shortly."
+                )
+                return (True, True, enhanced_message, {})
+
+            return (True, True, f"Certificate with name {cert_name} deleted successfully", {})
+        except exceptions.CertificateDoesNotExist as dne:
+            self.logger.warning(f"AnsibleClient: Certificate with name '{cert_name}' does not exist")
+            return (True, False, str(dne), {})
+        except Exception as e:
+            self.logger.error(f"AnsibleClient: Certificate deletion for name '{cert_name}' failed: {e}")
+            return (False, False, f"Certificate deletion for name {cert_name} failed | {e}", {})
+
+    def patch_certificate_by_name(self, cert_name, authority_chain=None, certificate=None, vcguid=None, **kwargs):
+        """Patch certificate by certificate name."""
+        self.logger.info(f"AnsibleClient: Patching certificate with name '{cert_name}'")
+        try:
+            resp = self.certificate_workflow.patch_certificate_by_name(cert_name, authority_chain, certificate, vcguid, **kwargs)
+            self.logger.info(f"AnsibleClient: Certificate with name '{cert_name}' patched successfully")
+            return (True, True, f"Certificate with name {cert_name} patched successfully", {})
+        except exceptions.CertificateDoesNotExist as dne:
+            self.logger.warning(f"AnsibleClient: Certificate with name '{cert_name}' does not exist")
+            return (True, False, str(dne), {})
+        except Exception as e:
+            self.logger.error(f"AnsibleClient: Certificate patching for name '{cert_name}' failed: {e}")
+            return (False, False, f"Certificate patching for name {cert_name} failed | {e}", {})
+
+    # Alert related workflow operations
+    def get_alerts(self, alert_type=None, severity=None, status=None,
+                   last_days=None, last_hours=None):
+        """Get alerts with optional filters (GET /api/v3/alerts)."""
+        self.logger.info(
+            f"AnsibleClient: Getting alerts (type={alert_type}, severity={severity}, "
+            f"status={status}, last_days={last_days}, last_hours={last_hours})"
+        )
+        try:
+            resp = self.alert_workflow.get_alerts(
+                alert_type=alert_type,
+                severity=severity,
+                status=status,
+                last_days=last_days,
+                last_hours=last_hours
+            )
+            count = len(resp) if isinstance(resp, list) else 0
+            self.logger.info(f"AnsibleClient: Alerts retrieved successfully ({count} matches)")
+            return (True, False, f"Alerts retrieved successfully ({count} matches)", {"response": resp})
+        except Exception as e:
+            self.logger.error(f"AnsibleClient: Failed to get alerts: {e}")
+            return (False, False, f"Failed to get alerts | {e}", {})
+
+    def test_alert(self, message=None):
+        """Generate a test alert (POST /api/v3/alerts/custom with TEST_ALERT action)."""
+        self.logger.info(f"AnsibleClient: Generating test alert")
+        try:
+            resp = self.alert_workflow.test_alert(message)
+            self.logger.info(f"AnsibleClient: Test alert generated successfully")
+            return (True, True, "Test alert generated successfully", {})
+        except Exception as e:
+            self.logger.error(f"AnsibleClient: Test alert generation failed: {e}")
+            return (False, False, f"Test alert generation failed | {e}", {})
+
+        
     # Host related workflows
     # Note: Few host operations are yet not supported in v3 so utilizing v1 implementation for time being.
     # As and when all the operations are supported in v3, will migrate to v3 implementation.

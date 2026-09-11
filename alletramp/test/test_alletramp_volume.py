@@ -117,7 +117,8 @@ class TestAlletrampVolume(unittest.TestCase):
         'ransomWare': None,
         'growth_size_mib': None,
         'wwn': None,
-        'saveToNewName': None
+        'saveToNewName': None,
+        'cascade': True
     }
 
     PARAMS_FOR_MODIFY_VOLUME = {
@@ -234,7 +235,8 @@ class TestAlletrampVolume(unittest.TestCase):
         "ransomWare": {"type": "bool", "default": None},
         "growth_size_mib": {"type": "int"},
         "wwn": {"type": "str"},
-        "saveToNewName": {"type": "str"}
+        "saveToNewName": {"type": "str"},
+        "cascade": {"type": "bool", "default": True}
     }
 
     # =========================================================================
@@ -401,7 +403,7 @@ class TestAlletrampVolume(unittest.TestCase):
 
         volume.main()
 
-        mock_flowkit_client.delete_volume.assert_called_with(name='test_volume')
+        mock_flowkit_client.delete_volume.assert_called_with(name='test_volume', cascade=True)
         instance.exit_json.assert_called_with(
             changed=True, msg="Volume test_volume deleted successfully"
         )
