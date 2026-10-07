@@ -1,0 +1,11 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+galaxy_info:
+  role_name: common
+  author: HPE CSI Team
+  description: >-
+    Shared defaults, WSAPI constants, session login and async task polling used
+    by every hpe.csi_failback role.
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+dependencies: []

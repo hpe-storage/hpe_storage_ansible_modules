@@ -1,0 +1,29 @@
+---
+namespace: hpe
+name: csi_failback
+version: 0.1.0
+readme: README.md
+authors:
+  - HPE CSI Team
+description: >-
+  Zero-Touch Failback orchestrator for HPE Alletra MP B10000 Active Peer
+  Persistence volumes provisioned by the HPE CSI Driver. Control-plane only:
+  WSAPI + Kubernetes API. Never touches devices, multipath or mounts.
+license_file: LICENSE
+tags:
+  - hpe
+  - storage
+  - kubernetes
+  - openshift
+  - csi
+  - disaster_recovery
+dependencies:
+  # Must agree with requirements.yml: 3.x is the first branch supporting
+  # ansible-core 2.15+. 2.4.x is rejected by the modules at run time.
+  "kubernetes.core": ">=3.0.0,<6.0.0"
+repository: https://github.com/hpe-storage/hpe_storage_ansible_modules
+documentation: https://github.com/hpe-storage/hpe_storage_ansible_modules/blob/main/alletramp/csi_failback/README.md
+issues: https://github.com/hpe-storage/hpe_storage_ansible_modules/issues
+build_ignore:
+  - "*.tar.gz"
+  - .venv

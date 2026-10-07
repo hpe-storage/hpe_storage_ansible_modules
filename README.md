@@ -23,6 +23,7 @@ These modules enable automation of HPE Alletra MP storage arrays with Ansible.
 5. [Getting Started](#getting-started)
 6. [Supported Modules](#supported-modules)
 7. [Module Reference](#module-reference)
+8. [CSI Failback for Active Peer Persistence (Tech Preview)](#csi-failback-for-active-peer-persistence-tech-preview)
 
 ---
 
@@ -165,6 +166,11 @@ cd hpe_storage_ansible_modules
   - `modules/` - Ansible modules for HPE Alletra MP
   - `playbooks/` - Example playbooks and templates
   - `ansible.cfg` - Sample Ansible configuration
+  - `csi_failback/` - **Tech Preview.** Self-contained `hpe.csi_failback` Ansible
+    collection that fails HPE CSI Driver volumes back to a recovered primary
+    array after an Active Peer Persistence failover. It does **not** use the
+    modules above or `hpe_storage_flowkit_py`; see
+    [its own README](alletramp/csi_failback/README.md) for setup and usage.
 
 ---
 
@@ -343,3 +349,36 @@ This section provides an overview of all modules available in the HPE Storage An
 | [`alletramp_vlun`](alletramp/modules/readme.md#alletramp_vlun) | Manages VLUN operations for exporting |
 | [`alletramp_volume`](alletramp/modules/readme.md#alletramp_volume) | Manages volume operations |
 | [`alletramp_volumeset`](alletramp/modules/readme.md#alletramp_volumeset) | Manages volume set operations |
+
+---
+
+# CSI Failback for Active Peer Persistence (Tech Preview)
+
+`alletramp/csi_failback/` ships the **`hpe.csi_failback`** Ansible collection,
+which automates failing HPE CSI Driver volumes back to a recovered primary
+HPE Alletra Storage MP B10000 array after an Active Peer Persistence (APP)
+failover on Kubernetes / OpenShift. It recreates missing VLUNs on the
+recovered array, verifies replication is synced and quorum is healthy, issues
+the Remote Copy `SWITCHOVER_GROUP`, reconciles the `HPEReplicationMapping`
+CRD and restarts the affected workloads — all behind safety gates.
+
+**This release supports a single Remote Copy Group per run.**
+
+This component is **self-contained** and is set up differently from the
+modules above:
+
+- It is an Ansible *collection* with roles and playbooks, not `alletramp_*` modules.
+- It does **not** use `hpe_storage_flowkit_py`, `PYTHONPATH` or `library=`.
+- It talks to the arrays over WSAPI and to Kubernetes over its API directly.
+- It requires ansible-core 2.15–2.17 and `kubernetes.core` (installed from Galaxy).
+
+Follow the setup and run instructions in
+[`alletramp/csi_failback/README.md`](alletramp/csi_failback/README.md).
+
+```bash
+cd alletramp/csi_failback
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+ansible-galaxy collection install -r requirements.yml -p ./collections
+ansible-playbook playbooks/preflight.yml --ask-vault-pass      # read-only readiness check
+```

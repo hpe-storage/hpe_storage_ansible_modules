@@ -1,0 +1,11 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# Roles other than `common` do not define their own defaults; they consume the
+# shared ones so that a single group_vars file configures the whole collection.
+# These meta files exist only to satisfy role discovery.
+galaxy_info:
+  author: HPE CSI Team
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+dependencies: []

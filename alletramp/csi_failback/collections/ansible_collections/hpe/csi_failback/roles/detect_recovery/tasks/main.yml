@@ -1,0 +1,195 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# ROLE 1 of 6 — detect_recovery
+#
+# Determine whether the ORIGINAL PRIMARY array (the one that went down) is back
+# online and has stayed healthy long enough to be trusted.
+#
+# Sets:
+#   fb_original_primary_recovered : bool
+#   fb_recovery_detected_at       : ISO timestamp
+#
+# WHY A STABILITY WINDOW. An array recovering from a controller failure or a
+# firmware update can answer WSAPI while still flapping. Switching over to a
+# flapping array produces a failover->failback->failover loop that is far worse
+# than staying on the surviving array. We therefore require N consecutive
+# successful health probes spanning failback_min_stable_window_seconds before
+# we declare recovery. This mirrors the CheckArrayHealth logic in the CSI
+# driver (CON-3268) rather than inventing a second, divergent health notion.
+
+- name: "Detect | announce"
+  ansible.builtin.debug:
+    msg: >-
+      Probing original primary '{{ failback_original_primary.name }}' for
+      recovery. Stability window={{ failback_min_stable_window_seconds }}s,
+      timeout={{ failback_detect_timeout_seconds }}s.
+
+- name: "Detect | wait for WSAPI port to accept connections"
+  ansible.builtin.wait_for:
+    host: "{{ failback_original_primary.wsapi_url
+              | urlsplit('hostname') }}"
+    port: "{{ failback_original_primary.wsapi_url
+              | urlsplit('port') | default(443, true) }}"
+    timeout: "{{ failback_detect_timeout_seconds | int }}"
+    state: started
+  register: _fb_port_up
+
+- name: "Detect | login to original primary"
+  ansible.builtin.include_role:
+    name: hpe.csi_failback.common
+    tasks_from: wsapi_login.yml
+  vars:
+    _fb_array: "{{ failback_original_primary }}"
+    _fb_role: original_primary
+
+# Compute how many probes cover the stability window. Minimum of 2 so that we
+# always sample more than a single instant, even if an operator sets the window
+# to something tiny during a demo.
+- name: "Detect | compute probe count for stability window"
+  ansible.builtin.set_fact:
+    _fb_probe_count: >-
+      {{ [2, ((failback_min_stable_window_seconds | int)
+              // (failback_detect_interval_seconds | int))] | max }}
+
+- name: "Detect | probe array health repeatedly across the stability window"
+  ansible.builtin.uri:
+    url: "{{ failback_original_primary.wsapi_url }}{{ wsapi_system_path }}"
+    method: GET
+    headers:
+      X-HP3PAR-WSAPI-SessionKey: "{{ fb_session_original_primary }}"
+    status_code: [200]
+    validate_certs: "{{ failback_original_primary.validate_certs }}"
+    use_proxy: "{{ failback_wsapi_use_proxy | default(false) | bool }}"
+    timeout: 20
+  register: _fb_health_probes
+  loop: "{{ range(0, _fb_probe_count | int) | list }}"
+  loop_control:
+    label: "probe {{ item + 1 }}/{{ _fb_probe_count }}"
+    pause: "{{ failback_detect_interval_seconds | int }}"
+
+- name: "Detect | evaluate probe results"
+  ansible.builtin.set_fact:
+    _fb_failed_probes: >-
+      {{ _fb_health_probes.results
+         | rejectattr('status', 'equalto', 200)
+         | list | length }}
+
+- name: "Detect | require every probe in the window to have succeeded"
+  ansible.builtin.assert:
+    that:
+      - _fb_failed_probes | int == 0
+    fail_msg: >-
+      Original primary '{{ failback_original_primary.name }}' answered but was
+      NOT stable: {{ _fb_failed_probes }} of {{ _fb_probe_count }} health probes
+      failed across the {{ failback_min_stable_window_seconds }}s window.
+      Refusing to proceed — a flapping array must not be failed back to.
+    success_msg: >-
+      Original primary is stable across all {{ _fb_probe_count }} probes.
+    quiet: true
+
+- name: "Detect | resolve the array-local RCG name on the original primary"
+  ansible.builtin.include_role:
+    name: hpe.csi_failback.common
+    tasks_from: wsapi_resolve_rcg.yml
+  vars:
+    _fb_array: "{{ failback_original_primary }}"
+    _fb_role: original_primary
+
+- name: "Detect | verify the array reports itself as the RCG SECONDARY"
+  # Sanity check on our own assumptions. If the original primary already thinks
+  # it is the primary, either failover never happened or somebody already
+  # switched over manually. Either way, continuing would be wrong.
+  ansible.builtin.uri:
+    url: >-
+      {{ failback_original_primary.wsapi_url }}{{ wsapi_rcg_path }}/{{ fb_rcg_name_original_primary }}
+    method: GET
+    headers:
+      X-HP3PAR-WSAPI-SessionKey: "{{ fb_session_original_primary }}"
+    status_code: [200, 404]
+    validate_certs: "{{ failback_original_primary.validate_certs }}"
+    use_proxy: "{{ failback_wsapi_use_proxy | default(false) | bool }}"
+    timeout: 30
+  register: _fb_rcg_on_original
+
+- name: "Detect | record recovery facts"
+  ansible.builtin.set_fact:
+    # NOTE: "recovered" means only that the array answered WSAPI stably across
+    # the window. It does NOT mean a failover occurred — that is decided by the
+    # RCG role assertion below, which is the authority on whether there is
+    # anything to fail back.
+    fb_original_primary_recovered: true
+    fb_recovery_detected_at: "{{ ansible_date_time.iso8601 }}"
+    fb_original_primary_rcg_role: >-
+      {{ _fb_rcg_on_original.json.role | default('unknown') }}
+
+# ---------------------------------------------------------------------------
+# Is there actually anything to fail back?
+#
+# The three gates in verify_rcg_sync ask "is a switchover SAFE?". None of them
+# asks "is a switchover NEEDED?". Those are different questions, and on a
+# perfectly healthy pair the safety gates all pass precisely BECAUSE nothing is
+# wrong: the group is started, synced, and the witness is ACTIVE.
+#
+# So we check the role explicitly. After a failover the ORIGINAL PRIMARY has
+# been demoted and reports SECONDARY (2). If it reports PRIMARY (1) it still
+# owns the group and there is nothing to hand back.
+#
+# Without this assertion the preflight reports "READY TO FAIL BACK" on an
+# untouched cluster — a false positive that undermines the entire safety story.
+# In automatic mode we would then issue SWITCHOVER_GROUP against an array that
+# is currently the SECONDARY; the array itself rejects that with
+# RCOPY_GROUP_OPERATION_ONLY_ON_PRIMARY_SIDE, but relying on the array to catch
+# our own logic error is luck, not design.
+# ---------------------------------------------------------------------------
+
+- name: "Detect | the RCG must exist on the original primary"
+  ansible.builtin.assert:
+    that:
+      - _fb_rcg_on_original.status == 200
+    fail_msg: >-
+      Remote Copy Group '{{ failback_rcg_name }}' was not found on the original
+      primary '{{ failback_original_primary.name }}' (HTTP
+      {{ _fb_rcg_on_original.status }}). The array is reachable but does not
+      know about this group. Check failback_rcg_name and that the array is the
+      correct failback target.
+    success_msg: "RCG is present on the original primary."
+    quiet: true
+
+- name: "Detect | GATE 0 — a failover must actually have happened"
+  ansible.builtin.assert:
+    that:
+      - fb_original_primary_rcg_role | int == wsapi_rcg_role_secondary
+    fail_msg: >-
+      NOTHING TO FAIL BACK. The original primary
+      '{{ failback_original_primary.name }}' still reports the RCG
+      '{{ failback_rcg_name }}' as
+      {{ 'PRIMARY' if (fb_original_primary_rcg_role | int) == wsapi_rcg_role_primary
+         else 'role=' ~ fb_original_primary_rcg_role }},
+      so it never lost ownership of the group and no failover has occurred
+      (or a failback has already been completed).
+      Failback is only meaningful when this array reports SECONDARY (2).
+      Verify with 'showrcopy' on both arrays. If you believe a failover DID
+      happen, check that failback_original_primary and failback_current_primary
+      are not swapped in your inventory — the array that went DOWN goes in
+      failback_original_primary.
+      .
+      IF THE SWITCHOVER ALREADY SUCCEEDED and this run is only failing because
+      the array is now correct, the Kubernetes-side work (HPEReplicationMapping
+      swap, workload republish) may still be outstanding. Finish it with:
+        ansible-playbook playbooks/failback_resume.yml
+      which skips the switchover and reconciles only the cluster.
+    success_msg: >-
+      Failover confirmed: the original primary reports SECONDARY, so the RCG
+      can be handed back to it.
+    quiet: true
+
+- name: "Detect | summary"
+  ansible.builtin.debug:
+    msg:
+      - "Original primary recovered : {{ fb_original_primary_recovered }}"
+      - "Detected at                : {{ fb_recovery_detected_at }}"
+      - "RCG role on original array : {{ 'PRIMARY' if (fb_original_primary_rcg_role | int) == wsapi_rcg_role_primary
+                                        else 'SECONDARY' if (fb_original_primary_rcg_role | int) == wsapi_rcg_role_secondary
+                                        else 'UNKNOWN(' ~ fb_original_primary_rcg_role ~ ')' }}"
+      - "RCG present on original    : {{ _fb_rcg_on_original.status == 200 }}"

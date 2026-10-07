@@ -1,0 +1,83 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# Obtain a WSAPI v1 session key for one array.
+#
+# Expects:
+#   _fb_array   : dict with wsapi_url / username / password / validate_certs
+#   _fb_role    : "original_primary" | "current_primary" (for fact naming)
+#
+# Sets:
+#   fb_session_<_fb_role> : the session key string
+#
+# WHY a dedicated login task rather than basic auth on every call: WSAPI v1 has
+# no basic-auth mode for resource endpoints. Every request must carry the
+# X-HP3PAR-WSAPI-SessionKey header obtained from POST /api/v1/credentials.
+#
+# Sessions are bounded (default 15 min on most arrays). The whole failback
+# sequence can exceed that during a large resync, so callers re-invoke this
+# task file between long phases rather than holding one session throughout.
+# The legacy CSP's single long-lived session is exactly the pattern that
+# produced mid-batch re-auth storms; we avoid it by re-logging in explicitly.
+
+- name: "Login | assert array connection details are present ({{ _fb_role }})"
+  ansible.builtin.assert:
+    that:
+      - _fb_array.wsapi_url | default('') | length > 0
+      - _fb_array.username | default('') | length > 0
+      - _fb_array.password | default('') | length > 0
+    fail_msg: >-
+      Array '{{ _fb_role }}' is missing wsapi_url, username or password.
+      Populate failback_{{ _fb_role }} in your inventory or vault file.
+    quiet: true
+
+- name: "Login | create WSAPI session ({{ _fb_role }})"
+  ansible.builtin.uri:
+    url: "{{ _fb_array.wsapi_url }}{{ wsapi_credentials_path }}"
+    method: POST
+    body_format: json
+    body:
+      user: "{{ _fb_array.username }}"
+      password: "{{ _fb_array.password }}"
+      sessionType: 1
+    status_code: [200, 201]
+    validate_certs: "{{ _fb_array.validate_certs | default(false) }}"
+    use_proxy: "{{ failback_wsapi_use_proxy | default(false) | bool }}"
+    timeout: 30
+  register: _fb_login
+  # Credentials must never reach the log or a --verbose run.
+  no_log: true
+  retries: 3
+  delay: 5
+  until: _fb_login is succeeded
+  # WHY ignore + explicit assert instead of letting `uri` fail: `no_log: true`
+  # suppresses the failure payload as well as the request, so an unattended run
+  # shows only "FAILED - RETRYING ... (1 retries left)" with no cause. The next
+  # task re-emits just the status and reason — never the body, which echoes the
+  # submitted credentials on some WSAPI error paths.
+  failed_when: false
+
+- name: "Login | report WSAPI login failure ({{ _fb_role }})"
+  ansible.builtin.fail:
+    msg: >-
+      WSAPI login to {{ _fb_role }} ({{ _fb_array.name | default('unnamed') }})
+      at {{ _fb_array.wsapi_url }}{{ wsapi_credentials_path }} failed with
+      status {{ _fb_login.status | default('none') }}:
+      {{ _fb_login.msg | default('no response') }}.
+      401 => bad username/password (check your vault values are being resolved,
+      not passed through as a literal Jinja expression).
+      -1 / connection refused => WSAPI server not enabled or wrong port; run
+      'showwsapi' on the array and 'startwsapi' if it is not Active.
+      Certificate errors => set validate_certs: false for a self-signed array.
+  when: _fb_login is failed or (_fb_login.status | default(0)) not in [200, 201]
+
+- name: "Login | stash session key ({{ _fb_role }})"
+  ansible.builtin.set_fact:
+    "fb_session_{{ _fb_role }}": "{{ _fb_login.json.key }}"
+  no_log: true
+
+- name: "Login | confirm session established ({{ _fb_role }})"
+  ansible.builtin.debug:
+    msg: >-
+      WSAPI session established for {{ _fb_role }}
+      ({{ _fb_array.name | default('unnamed') }}) at {{ _fb_array.wsapi_url }}

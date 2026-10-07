@@ -1,0 +1,112 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# WSAPI constants, verified against the HPE WSAPI Developer Guide.
+#
+# remoteCopyGroupPOSTOperation enumeration (Remote Copy chapter, p.303):
+#   FAILOVER_GROUP    7
+#   SWITCHOVER_GROUP  8   Switches the primary to the secondary system
+#                         without impacting I/O. This is the failback verb.
+#   RECOVER_GROUP     9
+#   RESTORE_GROUP    10   Changes all groups to their natural direction and
+#                         starts them.
+#   OVERRIDE_GROUP   11
+#
+# remoteCopyGroupPUTOperation enumeration (p.302):
+#   ADMIT_VV 1, DISMISS_VV 2, START_GROUP 3, STOP_GROUP 4, SYNC_GROUP 5
+#
+# Getting these numbers wrong is catastrophic: FAILOVER_GROUP (7) on a healthy
+# pair is NOT the inverse of a failover — it forces the *other* side to take
+# over. SWITCHOVER_GROUP (8) is the only non-disruptive role reversal.
+wsapi_op_admit_vv: 1
+wsapi_op_dismiss_vv: 2
+wsapi_op_start_group: 3
+wsapi_op_stop_group: 4
+wsapi_op_sync_group: 5
+wsapi_op_failover_group: 7
+wsapi_op_switchover_group: 8
+wsapi_op_recover_group: 9
+wsapi_op_restore_group: 10
+wsapi_op_override_group: 11
+
+# VLUNType enumeration (VLUN chapter, p.228). The CSI driver uses HOST (3),
+# i.e. "Host-Sees". MATCHED_SET (4) creates one object per port and is what
+# limited the legacy CSP's attachment scale (CON-3913) — we do not create it.
+wsapi_vlun_type_empty: 1
+wsapi_vlun_type_port: 2
+wsapi_vlun_type_host: 3
+wsapi_vlun_type_matched_set: 4
+wsapi_vlun_type_host_set: 5
+
+# Quorum status enumeration (Remote Copy chapter, p.273):
+#   1 UNINITIALIZED  2 INITIALIZING  3 STANDBY  4 ACTIVE
+#   5 FAILSAFE       6 FAILOVER      7 RESTARTING       99 UNKNOWN
+#
+# Only STANDBY and ACTIVE mean "a working arbiter exists". FAILSAFE and
+# FAILOVER mean the witness is already dealing with a split, which is the worst
+# possible moment to reverse a role.
+wsapi_quorum_status_uninitialized: 1
+wsapi_quorum_status_initializing: 2
+wsapi_quorum_status_standby: 3
+wsapi_quorum_status_active: 4
+wsapi_quorum_status_failsafe: 5
+wsapi_quorum_status_failover: 6
+wsapi_quorum_status_restarting: 7
+wsapi_quorum_status_unknown: 99
+
+wsapi_quorum_healthy_states: [3, 4]
+
+# rcopyGroupRoleEnum (Remote Copy chapter, p.335):
+#   PRIMARY 1, SECONDARY 2
+#
+# This is the enum that tells us whether a failover has actually happened. On a
+# healthy pair the ORIGINAL PRIMARY reports PRIMARY; after a failover it reports
+# SECONDARY. Failback is only meaningful in the second case.
+wsapi_rcg_role_primary: 1
+wsapi_rcg_role_secondary: 2
+
+# ---------------------------------------------------------------------------
+# Array identity in the HPEReplicationMapping CRD
+#
+# CRITICAL: the CRD does NOT store the Remote Copy target name. It stores the
+# array's MANAGEMENT IP, as written by the CSP in create_volume_cmd.go from
+# cmd.arrayIP, and it usually carries the port:
+#
+#   primary_array_details: { name: "10.132.239.130:443", cpg: ..., secret: ... }
+#   target_array_details:  { name: "10.132.239.141:443", ... }
+#
+# whereas failback_*_primary.name is the rcopy target name ("s042N-FC"). Those
+# two identifiers NEVER match, so any comparison between them is always false.
+#
+# The CSP itself compares with GetCanonicalIPAddress() (utils/utils.go:522),
+# which strips the port/brackets/zone before comparing. We mirror that: derive
+# the IP from wsapi_url and compare canonically. Never compare CRD array names
+# against the rcopy target name.
+# ---------------------------------------------------------------------------
+fb_original_primary_ip: >-
+  {{ failback_original_primary.wsapi_url | urlsplit('hostname') }}
+fb_current_primary_ip: >-
+  {{ failback_current_primary.wsapi_url | urlsplit('hostname') }}
+
+# Session key header. WSAPI v1 uses this header name; it is not a bearer token.
+#
+# NOTE: this constant is documentation only — the tasks spell the header out
+# literally. Ansible templates dictionary *values* but NOT dictionary *keys* in
+# module arguments, so `"{{ wsapi_session_header }}": "{{ key }}"` sends a
+# header literally named "{{ wsapi_session_header }}". The array then sees no
+# session key and answers HTTP 400 Bad Request on every call — a confusing
+# failure, because login itself succeeds. Do not reintroduce the templated key.
+wsapi_session_header: "X-HP3PAR-WSAPI-SessionKey"
+
+wsapi_credentials_path: "/api/v1/credentials"
+wsapi_rcg_path: "/api/v1/remotecopygroups"
+wsapi_vluns_path: "/api/v1/vluns"
+# Volume inventory. Needed because the array TRUNCATES volume names (a
+# Kubernetes PV "pvc-236a1263-4b12-4c19-942e-e1fde5320ea6" is stored as
+# "pvc-236a1263-4b12-4c19-942e-e1f"), so a VLUN POST using the untruncated
+# name fails with 404 "volume does not exist". We resolve the real name from
+# this list instead of guessing a truncation length.
+wsapi_volumes_path: "/api/v1/volumes"
+wsapi_hosts_path: "/api/v1/hosts"
+wsapi_system_path: "/api/v1/system"
+wsapi_tasks_path: "/api/v1/tasks"

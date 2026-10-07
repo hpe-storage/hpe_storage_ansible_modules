@@ -1,0 +1,113 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# Zero-Touch Failback — main orchestration playbook.
+#
+# Runs the roles in the only order that is safe:
+#
+#   1. detect_recovery                is the original primary back and STABLE?
+#   2. rehydrate_hosts_vluns          recreate hosts/VLUNs it lost while down
+#   3. verify_rcg_sync                HARD GATE: synced + quorum, or abort
+#   4. reconcile_replication_mapping  phase=pre — repair the mapping if the CSP
+#      (phase=pre)                    never swapped it at failover time
+#   5. switchover                     reverse the RCG role on the array
+#   6. reconcile_replication_mapping  phase=post — swap primary/target so the
+#      (phase=post)                   driver's view matches the array's view
+#   7. republish_workloads            batched restart so volumes re-attach
+#   8. verify_and_report              prove it worked, measure RTO, audit
+#
+# WHY THE MAPPING IS RECONCILED TWICE.
+#
+# The CSP only swaps HPEReplicationMapping as a side-effect of servicing a
+# publish (utils/remote_copy_validation.go:844). At failover time that happens
+# only if the pods were republished, and even then only if the CSP-side guard
+# fires. So when we arrive here the mapping may still name the array that WENT
+# DOWN as primary — a topology that has not existed since the outage began.
+#
+#   phase=pre  (step 4) repairs that, recording the CURRENT primary. This
+#              matters because between step 4 and step 6 the array is still
+#              served by the current primary; any publish in that window (pod
+#              reschedule, node recovery, CSI retry) must not be pointed at the
+#              array that is currently the secondary. It also guarantees the
+#              step 6 swap starts from a known-good state — a blind swap of a
+#              stale mapping produces exactly the wrong answer.
+#
+#   phase=post (step 6) performs the real failback swap, and must land BEFORE
+#              step 7 or the driver publishes against the old primary.
+#
+# Everything runs on localhost: this is a control-plane orchestration, it never
+# connects to a worker node and never touches a device, mount or multipath map.
+#
+# IF A RUN ABORTS AFTER THE SWITCHOVER. This playbook cannot simply be re-run:
+# detect_recovery's GATE 0 requires the original primary to report SECONDARY,
+# and once the role reversal has landed it reports PRIMARY. That gate is
+# correct and must not be relaxed. Use playbooks/failback_resume.yml, which
+# verifies the array is already failed back and then runs only steps 6-8.
+#
+# Usage:
+#   ansible-playbook playbooks/failback.yml --check          # dry run
+#   ansible-playbook playbooks/failback.yml                  # approval mode
+#   ansible-playbook playbooks/failback.yml -e failback_mode=automatic
+
+- name: Zero-Touch Failback for HPE Alletra MP B10000 Peer Persistence
+  hosts: localhost
+  gather_facts: true
+  connection: local
+
+  pre_tasks:
+    - name: "Preflight | required variables are set"
+      ansible.builtin.assert:
+        that:
+          - failback_rcg_name | default('') | length > 0
+          - failback_original_primary.name | default('') | length > 0
+          - failback_current_primary.name | default('') | length > 0
+        fail_msg: >-
+          Missing required configuration. You must set failback_rcg_name,
+          failback_original_primary and failback_current_primary. See
+          inventory/group_vars/all.yml.example.
+        quiet: true
+
+    - name: "Preflight | mode is recognised"
+      ansible.builtin.assert:
+        that:
+          - failback_mode in ['automatic', 'approval', 'off']
+        fail_msg: >-
+          failback_mode must be one of: automatic, approval, off
+          (got '{{ failback_mode }}').
+        quiet: true
+
+    - name: "Preflight | announce the run"
+      ansible.builtin.debug:
+        msg:
+          - "=============================================================="
+          - "  ZERO-TOUCH FAILBACK"
+          - "=============================================================="
+          - "RCG                : {{ failback_rcg_name }}"
+          - "Failing back to    : {{ failback_original_primary.name }}"
+          - "Currently primary  : {{ failback_current_primary.name }}"
+          - "Mode               : {{ failback_mode }}"
+          - "Check mode (dry run): {{ ansible_check_mode }}"
+          - "=============================================================="
+
+  roles:
+    - role: hpe.csi_failback.common
+    - role: hpe.csi_failback.detect_recovery
+      tags: [detect]
+    - role: hpe.csi_failback.rehydrate_hosts_vluns
+      tags: [rehydrate]
+    - role: hpe.csi_failback.verify_rcg_sync
+      tags: [verify, gate]
+    - role: hpe.csi_failback.reconcile_replication_mapping
+      vars:
+        fb_mapping_phase: pre
+      tags: [mapping, mapping_pre]
+    - role: hpe.csi_failback.switchover
+      tags: [switchover]
+    - role: hpe.csi_failback.reconcile_replication_mapping
+      vars:
+        fb_mapping_phase: post
+      tags: [mapping, mapping_post]
+    - role: hpe.csi_failback.republish_workloads
+      tags: [republish]
+    - role: hpe.csi_failback.verify_and_report
+      tags: [report]

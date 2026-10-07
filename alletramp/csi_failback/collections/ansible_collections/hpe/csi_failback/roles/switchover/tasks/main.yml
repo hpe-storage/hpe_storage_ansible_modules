@@ -1,0 +1,262 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# ROLE 4 of 6 — switchover
+#
+# Reverse the Remote Copy Group direction so the ORIGINAL PRIMARY becomes the
+# primary again. This is the one genuinely mutating array operation in the
+# whole sequence.
+#
+# VERB CHOICE. We issue SWITCHOVER_GROUP (8), which the WSAPI guide describes as
+# "switches the primary to the secondary system without impacting I/O".
+# We do NOT use:
+#   FAILOVER_GROUP (7) — for use when the primary is GONE. Issuing it on a
+#                        healthy pair forces an unclean promotion.
+#   RECOVER_GROUP  (9) — post-failover reconciliation, not a role reversal.
+#   RESTORE_GROUP (10) — restores ALL groups to natural direction; too broad,
+#                        it would disturb RCGs we were not asked to touch.
+#
+# The call is issued to the CURRENT PRIMARY (the array that is presently
+# serving I/O), because that is the side that owns the group and can hand the
+# role back cleanly.
+
+- name: "Switchover | refuse to run unless the gates passed"
+  # Defence in depth. The playbook orders the roles correctly, but if someone
+  # imports this role standalone we must not become a way to bypass the gates.
+  ansible.builtin.assert:
+    that:
+      - fb_gates_passed | default(false) | bool
+    fail_msg: >-
+      Refusing to switch over: verify_rcg_sync has not run or did not pass.
+      This role must never be invoked without the safety gates.
+    quiet: true
+
+- name: "Switchover | honour approval / off modes"
+  ansible.builtin.debug:
+    msg:
+      - "=========================================================="
+      - "MODE = {{ failback_mode }} — SWITCHOVER NOT EXECUTED"
+      - "=========================================================="
+      - "The following call WOULD have been made:"
+      - "  POST {{ failback_current_primary.wsapi_url }}{{ wsapi_rcg_path }}/{{ fb_rcg_name_current_primary | default(failback_rcg_name) }}/"
+      - "  body: action={{ wsapi_op_switchover_group }} (SWITCHOVER_GROUP)"
+      - "        no other members: targetName is only for multi-target groups,"
+      - "        skipStart is only valid for FAILOVER/RECOVER/RESTORE."
+      - ""
+      - "Result: RCG '{{ failback_rcg_name }}' primary role returns to"
+      - "        '{{ failback_original_primary.name }}'."
+      - ""
+      - "To execute, re-run with:  -e failback_mode=automatic"
+      - "=========================================================="
+  when: failback_mode != 'automatic'
+
+- name: "Switchover | end play here when not in automatic mode"
+  ansible.builtin.meta: end_play
+  when: failback_mode != 'automatic'
+
+- name: "Switchover | DRY RUN"
+  ansible.builtin.debug:
+    msg: >-
+      [check mode] Would POST action={{ wsapi_op_switchover_group }}
+      (SWITCHOVER_GROUP) to RCG '{{ failback_rcg_name }}', handing the primary
+      role back to '{{ failback_original_primary.name }}'. The body carries
+      only 'action'; the role first asserts the group has exactly one target.
+  when: ansible_check_mode
+
+- name: "Switchover | re-login to current primary (session may have aged out)"
+  # The sync wait in verify_rcg_sync can run for many minutes and the WSAPI
+  # session lifetime is short. Re-authenticating here is cheaper than debugging
+  # a 401 in the middle of the one irreversible call in the playbook.
+  ansible.builtin.include_role:
+    name: hpe.csi_failback.common
+    tasks_from: wsapi_login.yml
+  vars:
+    _fb_array: "{{ failback_current_primary }}"
+    _fb_role: current_primary
+  when: not ansible_check_mode
+
+- name: "Switchover | record start time for RTO measurement"
+  ansible.builtin.set_fact:
+    fb_switchover_started_at: "{{ ansible_date_time.iso8601 }}"
+    fb_switchover_epoch: "{{ ansible_date_time.epoch }}"
+
+# ---------------------------------------------------------------------------
+# How many Remote Copy targets does this group have?
+# ---------------------------------------------------------------------------
+# SWITCHOVER_GROUP takes a MINIMAL body — just 'action'. The WSAPI guide's
+# "Recovering a Remote Copy group" table (p.292) documents many members, but
+# each is scoped to particular operations, and the array rejects anything not
+# valid for the one you asked for (error 42 INV_INPUT_UNREC_NAME).
+#
+# targetName is the one we could legitimately need:
+#
+#   "The target name associated with the group on which to perform the
+#    disaster recovery operation. If the group has multiple targets, you
+#    must specify the target you want."
+#
+# So it is required ONLY for a multi-target group. With a single target the
+# array resolves it itself, and omitting it avoids the per-array naming
+# problem entirely — Remote Copy target names are per-array labels, and both
+# the inventory name ('s042N-FC') and the name echoed back in this group's own
+# targets[] were rejected here with ref: targetName.
+#
+# We therefore read the target list purely to ENFORCE the single-target
+# precondition (and to record what the array reports), not to build the body.
+- name: "Switchover | re-read the RCG on the current primary"
+  ansible.builtin.uri:
+    url: >-
+      {{ failback_current_primary.wsapi_url }}{{ wsapi_rcg_path }}/{{ fb_rcg_name_current_primary }}
+    method: GET
+    headers:
+      X-HP3PAR-WSAPI-SessionKey: "{{ fb_session_current_primary }}"
+    status_code: [200]
+    validate_certs: "{{ failback_current_primary.validate_certs }}"
+    use_proxy: "{{ failback_wsapi_use_proxy | default(false) | bool }}"
+    timeout: 30
+  register: _fb_rcg_before_switchover
+  when: not ansible_check_mode
+
+- name: "Switchover | collect the group's Remote Copy target names"
+  ansible.builtin.set_fact:
+    fb_switchover_target_names: >-
+      {{ _fb_rcg_before_switchover.json.targets | default([])
+         | map(attribute='targetName') | list }}
+  when: not ansible_check_mode
+
+- name: "Switchover | require exactly one Remote Copy target"
+  # With one target we may omit targetName. With several, the array REQUIRES
+  # it, and choosing for the operator would risk handing the primary role to
+  # the wrong site — a 3DC decision no automation should make silently.
+  ansible.builtin.assert:
+    that:
+      - fb_switchover_target_names | length == 1
+    fail_msg: >-
+      RCG '{{ failback_rcg_name }}' on
+      '{{ failback_current_primary.name }}' has
+      {{ fb_switchover_target_names | length }} Remote Copy targets
+      ({{ fb_switchover_target_names | join(', ') }}).
+      WSAPI requires an explicit targetName in that case. This role only
+      automates the unambiguous single-target group; perform a multi-target
+      switchover manually.
+    quiet: true
+  when: not ansible_check_mode
+
+- name: "Switchover | report the group's single target"
+  ansible.builtin.debug:
+    msg: >-
+      RCG '{{ fb_rcg_name_current_primary }}' on
+      '{{ failback_current_primary.name }}' has a single Remote Copy target,
+      reported as '{{ fb_switchover_target_names[0] }}'. Sending a minimal
+      SWITCHOVER_GROUP body (action only) so the array resolves the target
+      itself.
+  when: not ansible_check_mode
+
+- name: "Switchover | issue SWITCHOVER_GROUP on the current primary"
+  ansible.builtin.uri:
+    url: >-
+      {{ failback_current_primary.wsapi_url }}{{ wsapi_rcg_path }}/{{ fb_rcg_name_current_primary }}/
+    method: POST
+    headers:
+      X-HP3PAR-WSAPI-SessionKey: "{{ fb_session_current_primary }}"
+    body_format: json
+    # The body carries ONLY 'action'. Every other member of the "Recovering a
+    # Remote Copy group" table (p.292) is scoped to particular operations, and
+    # this array rejects any field not valid for the operation you asked for,
+    # with error 42 INV_INPUT_UNREC_NAME ("a name-value pair with a name that
+    # is unrecognized"; ref names the offending field):
+    #
+    #   targetName — only needed when the group has MULTIPLE targets. We assert
+    #                above that there is exactly one, so the array resolves it.
+    #   skipStart  — the guide scopes it to "FAILOVER, RECOVER, RESTORE".
+    #                SWITCHOVER is not in that list, hence ref: skipStart.
+    #
+    # Omitting skipStart is also what we want semantically: its default is
+    # false, i.e. the group IS started in its natural direction after the role
+    # reversal, so replication keeps protecting the workload we are moving
+    # back. We were asking for the default behaviour with an illegal field.
+    #
+    # The dict is rendered with to_json DELIBERATELY. Writing
+    # `action: "{{ wsapi_op_switchover_group }}"` inline sends the STRING "8"
+    # and WSAPI rejects it with error 39 ("wrong type for value", ref: action)
+    # because remoteCopyGroupPOSTOperation is an integer enum. `| int` inside a
+    # quoted YAML scalar is not enough — the quotes make it a string again.
+    # to_json preserves int/bool types exactly, and the uri module passes a
+    # pre-serialised string body straight through when body_format is json.
+    body: >-
+      {{ {'action': wsapi_op_switchover_group | int} | to_json }}
+    status_code: [200, 201, 202]
+    validate_certs: "{{ failback_current_primary.validate_certs }}"
+    use_proxy: "{{ failback_wsapi_use_proxy | default(false) | bool }}"
+    timeout: 120
+  register: fb_switchover_result
+  when: not ansible_check_mode
+
+- name: "Switchover | await the switchover task"
+  ansible.builtin.include_role:
+    name: hpe.csi_failback.common
+    tasks_from: wsapi_wait_task.yml
+  vars:
+    _fb_array: "{{ failback_current_primary }}"
+    _fb_session: "{{ fb_session_current_primary }}"
+    _fb_task_id: "{{ fb_switchover_result.json.taskId }}"
+    _fb_task_label: "SWITCHOVER_GROUP {{ failback_rcg_name }}"
+  when:
+    - not ansible_check_mode
+    - fb_switchover_result.json.taskId is defined
+
+- name: "Switchover | re-login to original primary to confirm the new role"
+  ansible.builtin.include_role:
+    name: hpe.csi_failback.common
+    tasks_from: wsapi_login.yml
+  vars:
+    _fb_array: "{{ failback_original_primary }}"
+    _fb_role: original_primary
+  when: not ansible_check_mode
+
+- name: "Switchover | verify the original primary now owns the RCG"
+  # Read back from the OTHER array. Trusting the response of the call we just
+  # made would only tell us the request was accepted, not that the role
+  # actually moved.
+  ansible.builtin.uri:
+    url: >-
+      {{ failback_original_primary.wsapi_url }}{{ wsapi_rcg_path }}/{{ fb_rcg_name_original_primary }}
+    method: GET
+    headers:
+      X-HP3PAR-WSAPI-SessionKey: "{{ fb_session_original_primary }}"
+    status_code: [200]
+    validate_certs: "{{ failback_original_primary.validate_certs }}"
+    use_proxy: "{{ failback_wsapi_use_proxy | default(false) | bool }}"
+    timeout: 30
+  register: _fb_rcg_after
+  # rcopyGroupRoleEnum: PRIMARY=1, SECONDARY=2. WSAPI returns role as an
+  # INTEGER ("role": 1), not a string — comparing it to 'primary' is always
+  # false and made a SUCCESSFUL switchover look like a failure until the
+  # retries ran out. detect_recovery already compares numerically; this
+  # matches it.
+  until: (_fb_rcg_after.json.role | default(0) | int) == wsapi_rcg_role_primary
+  retries: 30
+  delay: 10
+  when: not ansible_check_mode
+
+- name: "Switchover | assert the role reversal actually took effect"
+  ansible.builtin.assert:
+    that:
+      - (_fb_rcg_after.json.role | default(0) | int) == wsapi_rcg_role_primary
+    fail_msg: >-
+      SWITCHOVER did not take effect. RCG '{{ failback_rcg_name }}' on
+      '{{ failback_original_primary.name }}' still reports role
+      '{{ "SECONDARY" if (_fb_rcg_after.json.role | default(0) | int) == wsapi_rcg_role_secondary
+          else _fb_rcg_after.json.role | default("unknown") }}'.
+      DO NOT restart workloads. Inspect with showrcopy -d {{ failback_rcg_name }}
+      on both arrays before taking any further action.
+    success_msg: >-
+      Role reversal confirmed: '{{ failback_original_primary.name }}' is now
+      the primary for RCG '{{ failback_rcg_name }}'.
+    quiet: true
+  when: not ansible_check_mode
+
+- name: "Switchover | record completion"
+  ansible.builtin.set_fact:
+    fb_switchover_completed: true
+    fb_switchover_completed_at: "{{ ansible_date_time.iso8601 }}"
+  when: not ansible_check_mode

@@ -1,0 +1,261 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# ROLE 5 of 6 — republish_workloads
+#
+# After the role reversal the volumes are owned by the original primary again,
+# but running pods still hold node-stage state pointing at paths established
+# against the other array. The CSI driver re-runs ControllerPublish /
+# NodeStage only when the volume is detached and re-attached, which in practice
+# means the pod must be restarted.
+#
+# THIS IS THE THIRD MANUAL STEP WE ARE AUTOMATING.
+#
+# SCOPE. By default (failback_republish_scope=outage) only the pods that were
+# published WHILE the original primary was down are restarted. Pods that were
+# running before the outage already hold paths to both arrays and simply
+# follow the new primary after the role reversal; restarting them is needless
+# downtime. See the "Narrow the candidate pods" block below.
+#
+# SAFETY. We restart in small batches with a pause between them so that:
+#   - PodDisruptionBudgets are respected (a rollout restart honours them, but
+#     firing every workload at once still causes a thundering herd of
+#     attach/detach against the array);
+#   - if something is wrong with the first batch we notice before we have
+#     disrupted the entire application.
+#
+# We never delete pods forcibly and we never touch a node. Restarting a
+# controller (Deployment/StatefulSet) and letting Kubernetes do the rest keeps
+# this role firmly in the control plane.
+
+- name: "Republish | skip if disabled"
+  ansible.builtin.debug:
+    msg: "Workload republish is disabled (failback_republish_enabled=false)."
+  when: not (failback_republish_enabled | bool)
+
+- name: "Republish | main"
+  when: failback_republish_enabled | bool
+  block:
+
+    - name: "Republish | require a confirmed switchover"
+      ansible.builtin.assert:
+        that:
+          - fb_switchover_completed | default(false) | bool or ansible_check_mode
+        fail_msg: >-
+          Refusing to restart workloads: the switchover was not confirmed.
+          Restarting pods while the RCG still points at the other array would
+          cause them to re-attach on the wrong side.
+        quiet: true
+
+    - name: "Republish | require the replication mapping to be reconciled first"
+      # ORDERING GUARD. The CSI driver reads HPEReplicationMapping to decide
+      # which array to publish against. If we restart pods while that CRD still
+      # names the pre-failover array as primary, the driver issues the publish
+      # to the array that is now the SECONDARY. Depending on timing that is
+      # either a failed attach or a successful attach on the wrong side — the
+      # latter being far worse because it looks like success.
+      #
+      # reconcile_replication_mapping must therefore have run and verified the
+      # swap before we get here. This assertion exists because running the
+      # roles out of order via --tags is otherwise easy and silently harmful.
+      #
+      # Specifically the POST phase: the pre-switchover phase records the
+      # CURRENT primary, which is the opposite of what the driver needs now.
+      ansible.builtin.assert:
+        that:
+          - fb_mapping_reconcile_post_done | default(false) | bool
+            or not (failback_reconcile_replication_mapping | bool)
+            or ansible_check_mode
+        fail_msg: >-
+          Refusing to restart workloads: the HPEReplicationMapping CRD has not
+          been reconciled. Kubernetes still believes
+          '{{ failback_current_primary.name }}' is the primary, but the array
+          has already handed the role back to
+          '{{ failback_original_primary.name }}'. Publishing now would target
+          the wrong array. Run the roles in order, or use the full playbook
+          rather than --tags republish.
+        quiet: true
+
+    - name: "Republish | fetch pods using the affected PVCs"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ item | default(omit, true) }}"
+        kubeconfig: "{{ failback_kubeconfig | default(omit, true) }}"
+        context: "{{ failback_kube_context | default(omit, true) }}"
+      loop: "{{ failback_namespaces if failback_namespaces | length > 0
+                else [omit] }}"
+      register: _fb_pods_raw
+
+    - name: "Republish | flatten pod list"
+      ansible.builtin.set_fact:
+        _fb_all_pods: >-
+          {{ _fb_pods_raw.results
+             | map(attribute='resources') | flatten | list }}
+
+    - name: "Republish | discover the PVs belonging to this RCG"
+      # Do our OWN discovery rather than relying on a fact left behind by
+      # rehydrate_hosts_vluns. That role does not run on the post-switchover
+      # resume path, and depending on it made this role fail with
+      # "'fb_target_volumes' is undefined" the moment the roles were run
+      # independently.
+      ansible.builtin.include_role:
+        name: hpe.csi_failback.common
+        tasks_from: discover_rcg_volumes.yml
+
+    - name: "Republish | collect the PVC names belonging to this RCG"
+      ansible.builtin.set_fact:
+        fb_target_pvc_names: >-
+          {{ fb_target_volumes
+             | selectattr('spec.claimRef', 'defined')
+             | map(attribute='spec.claimRef.name') | list }}
+
+    # -----------------------------------------------------------------------
+    # Narrow the candidate pods to those published DURING the outage
+    # -----------------------------------------------------------------------
+    # Pods that were already running before the original primary went down
+    # hold paths to BOTH arrays (that is what Active Peer Persistence gives
+    # us), so after the role reversal their I/O simply follows the new primary.
+    # Restarting them is pure downtime. Only pods whose volumes were first
+    # attached while the primary was unreachable have a single-sided path and
+    # genuinely need a re-attach.
+    #
+    # The authority for "attached during the outage" is the array itself:
+    # rehydrate_hosts_vluns records every (PV, node) pair it found WITHOUT a
+    # VLUN on the original primary (fb_outage_attachments) BEFORE it creates
+    # them. Optionally, failback_outage_start_time widens the set to any pod
+    # created after the operator-supplied outage start.
+    - name: "Republish | require outage detection facts when scope=outage"
+      ansible.builtin.assert:
+        that:
+          - fb_outage_attachments is defined
+        fail_msg: >-
+          failback_republish_scope=outage needs the attachment facts recorded
+          by rehydrate_hosts_vluns, which did not run in this play. Run the
+          full playbook (or include the 'rehydrate' tag), or set
+          failback_republish_scope=all to restart every workload in the RCG.
+        quiet: true
+      when: failback_republish_scope == 'outage'
+
+    - name: "Republish | build (PVC claim, node) pairs attached during the outage"
+      # Translate the array-side view (PV name, node) into what a Pod spec
+      # exposes (claimName, nodeName) so the filter below is a plain lookup.
+      ansible.builtin.set_fact:
+        _fb_outage_claim_node_keys: >-
+          {{ _fb_outage_claim_node_keys | default([]) + [
+               (fb_target_volumes
+                | selectattr('metadata.name', 'equalto', item.pv_name)
+                | map(attribute='spec.claimRef.name') | first | default(''))
+               ~ '@' ~ item.node ] }}
+      loop: "{{ fb_outage_attachments | default([]) }}"
+      loop_control:
+        label: "{{ item.pv_name }} @ {{ item.node }}"
+      when: failback_republish_scope == 'outage'
+
+    - name: "Republish | select affected pods"
+      ansible.builtin.set_fact:
+        _fb_affected_pods: >-
+          {{ _fb_affected_pods | default([]) + [item] }}
+      loop: "{{ _fb_all_pods }}"
+      loop_control:
+        label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+      vars:
+        _pod_claims: >-
+          {{ item.spec.volumes | default([])
+             | selectattr('persistentVolumeClaim', 'defined')
+             | map(attribute='persistentVolumeClaim.claimName') | list }}
+        _pod_rcg_claims: "{{ _pod_claims | select('in', fb_target_pvc_names) | list }}"
+        _pod_node: "{{ item.spec.nodeName | default('') }}"
+        _pod_outage_hit: >-
+          {{ _pod_rcg_claims
+             | map('regex_replace', '$', '@' ~ _pod_node)
+             | select('in', _fb_outage_claim_node_keys | default([]))
+             | list | length > 0 }}
+        _pod_after_outage_start: >-
+          {{ failback_outage_start_time | default('') | length > 0
+             and (item.metadata.creationTimestamp | default('')
+                  >= failback_outage_start_time) }}
+      when:
+        - item.metadata.ownerReferences is defined
+        - _pod_rcg_claims | length > 0
+        - failback_republish_scope == 'all'
+          or (_pod_outage_hit | bool)
+          or (_pod_after_outage_start | bool)
+
+    - name: "Republish | report pods left running (already dual-pathed)"
+      ansible.builtin.debug:
+        msg: >-
+          Scope={{ failback_republish_scope }}:
+          {{ _fb_affected_pods | default([]) | length }} of
+          {{ _fb_all_pods
+             | selectattr('spec.volumes', 'defined')
+             | selectattr('spec.volumes', 'truthy') | list | length }}
+          candidate pods were published during the outage and will be
+          restarted; the rest already have paths to the restored primary
+          and are left untouched.
+      when: failback_republish_scope == 'outage'
+
+    - name: "Republish | identify owning controllers of affected pods"
+      # We restart the CONTROLLER, not the pod. Deleting a bare pod that belongs
+      # to a StatefulSet just gets it recreated identically; issuing a rollout
+      # restart makes Kubernetes cycle them in order and respect the PDB.
+      #
+      # A pod's immediate owner is usually a ReplicaSet, which cannot be
+      # rollout-restarted. We strip the generated 8-11 char suffix to recover
+      # the Deployment name and rewrite the kind accordingly.
+      ansible.builtin.set_fact:
+        fb_workloads_to_restart: >-
+          {{ (fb_workloads_to_restart | default([])) + [{
+               'namespace': item.metadata.namespace,
+               'kind': (
+                 'Deployment'
+                 if ((item.metadata.ownerReferences | first).kind
+                     | default('')) == 'ReplicaSet'
+                 else (item.metadata.ownerReferences | first).kind
+                      | default('Pod')),
+               'name': (
+                 ((item.metadata.ownerReferences | first).name
+                  | default('') | regex_replace('-[a-z0-9]{6,11}$', ''))
+                 if ((item.metadata.ownerReferences | first).kind
+                     | default('')) == 'ReplicaSet'
+                 else (item.metadata.ownerReferences | first).name
+                      | default(item.metadata.name))
+             }] }}
+      loop: "{{ _fb_affected_pods | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+
+    - name: "Republish | deduplicate the restart list"
+      ansible.builtin.set_fact:
+        fb_workloads_to_restart: >-
+          {{ fb_workloads_to_restart | default([]) | unique }}
+
+    - name: "Republish | show restart plan"
+      ansible.builtin.debug:
+        msg:
+          - "Scope                : {{ failback_republish_scope }}"
+          - "Workloads to restart : {{ fb_workloads_to_restart | length }}"
+          - "Batch size           : {{ failback_republish_batch_size }}"
+          - "Pause between batches: {{ failback_republish_batch_pause_seconds }}s"
+          - "{{ fb_workloads_to_restart }}"
+
+    - name: "Republish | DRY RUN — no workloads will be restarted"
+      ansible.builtin.debug:
+        msg: >-
+          [check mode] Would issue a rollout restart of
+          {{ item.kind }}/{{ item.name }} in namespace {{ item.namespace }}.
+      loop: "{{ fb_workloads_to_restart | default([]) }}"
+      loop_control:
+        label: "{{ item.namespace }}/{{ item.name }}"
+      when: ansible_check_mode
+
+    - name: "Republish | restart workloads in batches"
+      ansible.builtin.include_tasks: restart_batch.yml
+      loop: >-
+        {{ fb_workloads_to_restart | default([])
+           | batch(failback_republish_batch_size | int) | list }}
+      loop_control:
+        loop_var: _fb_batch
+        index_var: _fb_batch_index
+        label: "batch {{ _fb_batch_index + 1 }}"
+      when: not ansible_check_mode

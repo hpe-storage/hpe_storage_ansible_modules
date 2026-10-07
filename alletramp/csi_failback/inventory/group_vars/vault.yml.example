@@ -1,0 +1,16 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# Template for the Ansible Vault file holding array credentials.
+#
+#   cp inventory/group_vars/vault.yml.example inventory/group_vars/vault.yml
+#   # edit the values
+#   ansible-vault encrypt inventory/group_vars/vault.yml
+#
+# ⛔ Never commit an unencrypted vault.yml. .gitignore already excludes it.
+
+vault_array_a_username: "3paradm"
+vault_array_a_password: "CHANGE_ME"
+
+vault_array_b_username: "3paradm"
+vault_array_b_password: "CHANGE_ME"

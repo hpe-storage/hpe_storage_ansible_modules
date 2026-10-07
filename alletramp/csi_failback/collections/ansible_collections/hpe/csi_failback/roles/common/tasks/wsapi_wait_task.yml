@@ -1,0 +1,53 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# Poll a WSAPI task to a terminal state.
+#
+# Expects:
+#   _fb_array       : array dict
+#   _fb_session     : session key
+#   _fb_task_id     : numeric task id returned by a mutating call
+#   _fb_task_label  : human label for logging
+#
+# WHY THIS EXISTS. Every mutating WSAPI call on the B10000 is asynchronous and
+# returns a task. Reporting success on the HTTP 200/201 alone is the single most
+# common cause of "the automation said it worked but the array disagrees".
+# Worse, reading back state before the task completes returns the PRE-change
+# view, which then gets cached and acted on. We always await the terminal state.
+#
+# Task status enumeration: 1 NORMAL(running) 2 DONE 3 CANCELLED 4 FAILED.
+# We treat anything other than DONE as a hard failure and abort the play. We do
+# NOT fall back to "assume it worked" — a half-applied role reversal is far more
+# dangerous than an aborted playbook that a human can inspect.
+
+- name: "Task | wait for task {{ _fb_task_id }} ({{ _fb_task_label }})"
+  ansible.builtin.uri:
+    url: "{{ _fb_array.wsapi_url }}{{ wsapi_tasks_path }}/{{ _fb_task_id }}"
+    method: GET
+    headers:
+      X-HP3PAR-WSAPI-SessionKey: "{{ _fb_session }}"
+    status_code: [200]
+    validate_certs: "{{ _fb_array.validate_certs | default(false) }}"
+    use_proxy: "{{ failback_wsapi_use_proxy | default(false) | bool }}"
+    timeout: 30
+  register: _fb_task_state
+  until: >-
+    _fb_task_state.json.status is defined and
+    _fb_task_state.json.status != 1
+  retries: "{{ (failback_task_timeout_seconds | int)
+               // (failback_task_poll_interval_seconds | int) }}"
+  delay: "{{ failback_task_poll_interval_seconds | int }}"
+
+- name: "Task | assert task {{ _fb_task_id }} completed successfully"
+  ansible.builtin.assert:
+    that:
+      - _fb_task_state.json.status | int == 2
+    fail_msg: >-
+      WSAPI task {{ _fb_task_id }} ({{ _fb_task_label }}) did not complete
+      successfully. Terminal status={{ _fb_task_state.json.status | default('unknown') }}
+      detail={{ _fb_task_state.json.detailedStatus | default('none') }}.
+      ABORTING. Do not re-run blindly — inspect the array task log first
+      (showtask -d {{ _fb_task_id }}).
+    success_msg: >-
+      WSAPI task {{ _fb_task_id }} ({{ _fb_task_label }}) completed.
+    quiet: true

@@ -1,0 +1,73 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# Copy this file to inventory/group_vars/all.yml and fill it in.
+#
+#   cp inventory/group_vars/all.yml.example inventory/group_vars/all.yml
+#
+# Put the PASSWORDS in an Ansible Vault file rather than here. See README §5.
+
+# ---------------------------------------------------------------------------
+# The Remote Copy Group to fail back
+# ---------------------------------------------------------------------------
+failback_rcg_name: "my-csi-rcg"
+
+# ---------------------------------------------------------------------------
+# ORIGINAL PRIMARY — the array that went down and that we are failing BACK to.
+# Right now it is the SECONDARY, because failover swapped the roles.
+# ---------------------------------------------------------------------------
+failback_original_primary:
+  name: "array-site-a"                    # rcopy target name, from showrcopy
+  wsapi_url: "https://10.10.0.10:443"
+  username: "{{ vault_array_a_username }}"
+  password: "{{ vault_array_a_password }}"
+  validate_certs: false                   # true in production
+
+# ---------------------------------------------------------------------------
+# CURRENT PRIMARY — the array that took over during the outage.
+# This is the original secondary.
+# ---------------------------------------------------------------------------
+failback_current_primary:
+  name: "array-site-b"
+  wsapi_url: "https://10.20.0.10:443"
+  username: "{{ vault_array_b_username }}"
+  password: "{{ vault_array_b_password }}"
+  validate_certs: false
+
+# ---------------------------------------------------------------------------
+# Policy
+# ---------------------------------------------------------------------------
+# approval  : do everything safe, stop before switchover, print the plan (default)
+# automatic : full unattended failback
+# off       : detect and report only
+failback_mode: approval
+
+# Require the recovered array to be continuously healthy for this long.
+failback_min_stable_window_seconds: 600
+
+# Hard gates. Do not relax these without understanding §7 of the README.
+failback_require_quorum_witness: true
+
+# ---------------------------------------------------------------------------
+# Workload republish
+# ---------------------------------------------------------------------------
+failback_republish_enabled: true
+# outage = restart only pods published while the original primary was down
+#          (detected from the array: no VLUN for them on that array).
+# all    = restart every workload using a PVC in the RCG.
+failback_republish_scope: outage
+# Optional: also restart pods created at/after this UTC instant.
+# failback_outage_start_time: "2026-10-05T04:46:11Z"
+failback_republish_batch_size: 1
+failback_republish_batch_pause_seconds: 30
+
+# Limit the blast radius to specific namespaces. Empty == all namespaces.
+failback_namespaces:
+  - demo-apps
+
+# ---------------------------------------------------------------------------
+# Kubernetes
+# ---------------------------------------------------------------------------
+failback_kubeconfig: "~/.kube/config"
+failback_kube_context: ""
+failback_csi_driver_name: "csi.hpe.com"

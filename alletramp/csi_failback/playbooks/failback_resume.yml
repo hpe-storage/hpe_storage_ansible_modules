@@ -1,0 +1,208 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# Zero-Touch Failback — RESUME after a completed switchover.
+#
+# ============================================================================
+# WHEN TO USE THIS
+# ============================================================================
+#
+# Use this playbook when the SWITCHOVER ALREADY SUCCEEDED on the array but the
+# failback run did not finish — so Kubernetes has not yet been told about the
+# new topology. The array is correct; the cluster is not.
+#
+# This is not hypothetical: it is exactly the state left behind when the
+# post-switchover verification aborts. The array reverses the role, then the
+# playbook stops before running:
+#
+#     reconcile_replication_mapping (phase=post)
+#     republish_workloads
+#     verify_and_report
+#
+# so HPEReplicationMapping still names the pre-failback primary, and the pods
+# are still attached against the array that took over during the outage.
+#
+# Confirm you are in that state before running this. On the ORIGINAL PRIMARY:
+#
+#     showrcopy | grep <rcg> -A2
+#
+# must show Role=Primary and Status=Started. If it shows Secondary, the
+# switchover did NOT happen and you want playbooks/failback.yml instead.
+#
+# ============================================================================
+# WHY THIS IS A SEPARATE PLAYBOOK, NOT A FLAG ON failback.yml
+# ============================================================================
+#
+# failback.yml cannot be re-run in this state, and that is BY DESIGN.
+# detect_recovery's GATE 0 asserts the original primary reports SECONDARY (2),
+# i.e. "a failover happened and has not yet been undone". Once the switchover
+# has completed that array reports PRIMARY (1) and GATE 0 correctly refuses.
+#
+# Relaxing GATE 0 to allow either role would be the wrong fix. It exists to
+# stop the collection issuing SWITCHOVER_GROUP against an array that is already
+# the primary — a false positive that would undermine the whole safety story on
+# an untouched cluster. So instead of weakening the gate, this playbook SKIPS
+# the roles whose preconditions are already satisfied and runs only the
+# remaining Kubernetes-side work.
+#
+# ============================================================================
+# WHAT IT DOES AND DOES NOT DO
+# ============================================================================
+#
+# Does NOT run:
+#   detect_recovery       — the array is already primary; nothing to detect
+#   verify_rcg_sync       — its gates protect the switchover, which is done
+#   switchover            — ALREADY DONE. Re-issuing it would reverse the
+#                           roles AGAIN and fail us straight back over.
+#
+# Does run:
+#   rehydrate_hosts_vluns          (see below)
+#   reconcile_replication_mapping (phase=post)
+#   republish_workloads
+#   verify_and_report
+#
+# WHY REHYDRATION RUNS HERE TOO, DESPITE HAPPENING BEFORE THE SWITCHOVER.
+# It is not a no-op on this path. Volumes provisioned WHILE the original
+# primary was down are replicated to it by Remote Copy, but never get a VLUN
+# there — the CSI driver could only map them on the surviving array. If the
+# earlier rehydration missed such a volume, the switchover completes and the
+# workload comes back with no path to its data. Running the role again closes
+# that gap; it is get-before-act throughout, so on an already-complete array it
+# creates nothing.
+#
+# Every role here is idempotent: rehydration only POSTs VLUNs that are absent,
+# the mapping role patches only on disagreement, and verify_and_report is
+# read-only. Running this twice is harmless.
+#
+# Usage:
+#   ansible-playbook playbooks/failback_resume.yml --check   # dry run first
+#   ansible-playbook playbooks/failback_resume.yml -e failback_mode=automatic
+
+- name: Zero-Touch Failback — resume post-switchover reconciliation
+  hosts: localhost
+  gather_facts: true
+  connection: local
+
+  pre_tasks:
+    - name: "Resume | required variables are set"
+      ansible.builtin.assert:
+        that:
+          - failback_rcg_name | default('') | length > 0
+          - failback_original_primary.name | default('') | length > 0
+          - failback_current_primary.name | default('') | length > 0
+        fail_msg: >-
+          Missing required configuration. You must set failback_rcg_name,
+          failback_original_primary and failback_current_primary. See
+          inventory/group_vars/all.yml.example.
+        quiet: true
+
+    # -----------------------------------------------------------------------
+    # Prove the switchover really did happen before we act on that assumption
+    # -----------------------------------------------------------------------
+    # The whole playbook is predicated on "the array is already failed back".
+    # We verify that against the array rather than trusting the operator, because
+    # if it is NOT true then reconciling the mapping to the original primary
+    # would point the CSI driver at the SECONDARY — the wrong-array attach this
+    # collection exists to prevent.
+    - name: "Resume | log in to the original primary"
+      ansible.builtin.include_role:
+        name: hpe.csi_failback.common
+        tasks_from: wsapi_login.yml
+      vars:
+        _fb_array: "{{ failback_original_primary }}"
+        _fb_role: original_primary
+
+    - name: "Resume | resolve the array-local RCG name"
+      # The RCG name differs per array and can change across a switchover, so
+      # resolve it rather than assuming failback_rcg_name works in the URL.
+      ansible.builtin.include_role:
+        name: hpe.csi_failback.common
+        tasks_from: wsapi_resolve_rcg.yml
+      vars:
+        _fb_array: "{{ failback_original_primary }}"
+        _fb_role: original_primary
+
+    - name: "Resume | read the RCG role from the original primary"
+      ansible.builtin.uri:
+        url: >-
+          {{ failback_original_primary.wsapi_url }}{{ wsapi_rcg_path }}/{{ fb_rcg_name_original_primary }}
+        method: GET
+        headers:
+          X-HP3PAR-WSAPI-SessionKey: "{{ fb_session_original_primary }}"
+        status_code: [200]
+        validate_certs: "{{ failback_original_primary.validate_certs }}"
+        use_proxy: "{{ failback_wsapi_use_proxy | default(false) | bool }}"
+        timeout: 30
+      register: _fb_resume_rcg
+
+    - name: "Resume | GATE — the switchover must already have completed"
+      # rcopyGroupRoleEnum is an INTEGER: 1=PRIMARY, 2=SECONDARY.
+      ansible.builtin.assert:
+        that:
+          - (_fb_resume_rcg.json.role | default(0) | int) == wsapi_rcg_role_primary
+        fail_msg: >-
+          REFUSING TO RESUME. The original primary
+          '{{ failback_original_primary.name }}' reports the RCG
+          '{{ failback_rcg_name }}' as SECONDARY, so the switchover has NOT
+          happened. This playbook only finishes the Kubernetes-side work AFTER
+          a successful role reversal. Run playbooks/failback.yml instead — it
+          will perform the switchover with the full safety gates.
+        success_msg: >-
+          Switchover confirmed on the array: '{{ failback_original_primary.name }}'
+          owns RCG '{{ failback_rcg_name }}' as PRIMARY. Proceeding to
+          reconcile Kubernetes with that topology.
+        quiet: true
+
+    # -----------------------------------------------------------------------
+    # Synthesise the facts the downstream roles expect
+    # -----------------------------------------------------------------------
+    # republish_workloads and reconcile_replication_mapping(phase=post) both
+    # assert fb_switchover_completed, which is normally set by the switchover
+    # role earlier in the same play. Here that role never ran, so we set it
+    # from the ARRAY'S OWN REPORTED STATE, which we just verified above — not
+    # as an unchecked override.
+    - name: "Resume | record the already-completed switchover"
+      ansible.builtin.set_fact:
+        fb_switchover_completed: true
+        fb_switchover_completed_at: "{{ ansible_date_time.iso8601 }}"
+        # verify_and_report measures RTO from this. There is no meaningful
+        # start time on a resume, so the elapsed figure in the report will be
+        # ~0 and must not be read as the real failback duration.
+        fb_switchover_epoch: "{{ ansible_date_time.epoch }}"
+        fb_switchover_started_at: "{{ ansible_date_time.iso8601 }}"
+        # verify_rcg_sync did not run in this play. Its gates exist solely to
+        # decide whether the switchover is SAFE TO PERFORM; that decision is
+        # already behind us, so satisfying the guard is correct here.
+        fb_gates_passed: true
+
+    - name: "Resume | announce"
+      ansible.builtin.debug:
+        msg:
+          - "=============================================================="
+          - "  FAILBACK RESUME — post-switchover reconciliation only"
+          - "=============================================================="
+          - "RCG                : {{ failback_rcg_name }}"
+          - "Now primary        : {{ failback_original_primary.name }} (verified)"
+          - "Was primary        : {{ failback_current_primary.name }}"
+          - "Mode               : {{ failback_mode }}"
+          - "Check mode (dry run): {{ ansible_check_mode }}"
+          - ""
+          - "SKIPPING detect_recovery, verify_rcg_sync and switchover —"
+          - "the role reversal is already done."
+          - ""
+          - "RUNNING rehydrate_hosts_vluns: volumes provisioned while the"
+          - "original primary was down may still have no VLUN on it."
+          - "=============================================================="
+
+  roles:
+    - role: hpe.csi_failback.common
+    - role: hpe.csi_failback.rehydrate_hosts_vluns
+      tags: [rehydrate]
+    - role: hpe.csi_failback.reconcile_replication_mapping
+      vars:
+        fb_mapping_phase: post
+      tags: [mapping, mapping_post]
+    - role: hpe.csi_failback.republish_workloads
+      tags: [republish]
+    - role: hpe.csi_failback.verify_and_report
+      tags: [report]

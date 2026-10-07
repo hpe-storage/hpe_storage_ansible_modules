@@ -1,0 +1,28 @@
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# Scoped to alletramp/csi_failback/ inside hpe_storage_ansible_modules.
+
+# Never commit real credentials or filled-in inventory.
+inventory/group_vars/all.yml
+inventory/group_vars/vault.yml
+*.vault
+.vaultpass
+
+# Collections installed from Galaxy at setup time. Only hpe/csi_failback is
+# source; kubernetes.core and friends come from requirements.yml.
+collections/ansible_collections/*
+!collections/ansible_collections/hpe/
+collections/ansible_collections/hpe/*
+!collections/ansible_collections/hpe/csi_failback/
+collections/ansible_collections/*.info/
+
+# Run artefacts (keep the directory so ansible.cfg's log_path works)
+reports/*
+!reports/.gitkeep
+*.retry
+*.log
+
+# Python
+.venv/
+__pycache__/
+*.pyc

@@ -1,0 +1,102 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# Restart one batch of workloads and wait for it to settle before returning.
+#
+# Included in a loop by republish_workloads/tasks/main.yml with _fb_batch set
+# to a list of {namespace, kind, name} dicts.
+#
+# WHY WE WAIT FOR EACH BATCH. If we fired every batch back-to-back we would
+# still produce a thundering herd of attach/detach operations against the array
+# and lose the "notice a problem early" property that batching is meant to buy.
+
+- name: "Republish | restart batch members"
+  kubernetes.core.k8s:
+    state: patched
+    api_version: apps/v1
+    kind: "{{ item.kind }}"
+    name: "{{ item.name }}"
+    namespace: "{{ item.namespace }}"
+    kubeconfig: "{{ failback_kubeconfig | default(omit, true) }}"
+    context: "{{ failback_kube_context | default(omit, true) }}"
+    definition:
+      spec:
+        template:
+          metadata:
+            annotations:
+              # Same mechanism as `kubectl rollout restart`: mutate the pod
+              # template so the controller rolls its pods, honouring the
+              # PodDisruptionBudget and updateStrategy.
+              kubectl.kubernetes.io/restartedAt: "{{ ansible_date_time.iso8601 }}"
+              csi.hpe.com/failback-restarted-at: "{{ ansible_date_time.iso8601 }}"
+              csi.hpe.com/failback-rcg: "{{ failback_rcg_name }}"
+  loop: "{{ _fb_batch }}"
+  loop_control:
+    label: "{{ item.namespace }}/{{ item.kind }}/{{ item.name }}"
+  register: _fb_restart_result
+
+- name: "Republish | wait for batch pods to become Ready again"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ item.namespace }}"
+    kubeconfig: "{{ failback_kubeconfig | default(omit, true) }}"
+    context: "{{ failback_kube_context | default(omit, true) }}"
+    wait: true
+    wait_condition:
+      type: Ready
+      status: "True"
+    wait_timeout: "{{ failback_republish_wait_timeout_seconds | int }}"
+    label_selectors:
+      - "csi.hpe.com/failback-rcg={{ failback_rcg_name }}"
+  loop: "{{ _fb_batch }}"
+  loop_control:
+    label: "{{ item.namespace }}/{{ item.name }}"
+  register: _fb_batch_ready
+  failed_when: false
+
+- name: "Republish | collect batch members that failed to become Ready"
+  # The wait above uses failed_when: false so that ALL batch members are probed
+  # and we can report every failure at once, rather than aborting on the first.
+  # That makes an explicit failure check mandatory here.
+  ansible.builtin.set_fact:
+    _fb_batch_not_ready: >-
+      {{ _fb_batch_ready.results | default([])
+         | selectattr('failed', 'defined')
+         | selectattr('failed')
+         | map(attribute='item.name')
+         | list }}
+
+- name: "Republish | verify the batch actually recovered"
+  # We do not silently continue past a batch that failed to come back. If the
+  # first batch cannot re-attach on the restored primary, restarting the rest
+  # would convert a partial problem into a full outage.
+  #
+  # NOTE: this previously asserted `_fb_batch_ready is defined`, which is ALWAYS
+  # true — the variable is registered unconditionally, and `failed_when: false`
+  # guarantees it exists even when every pod timed out. The guard therefore
+  # never fired, and a batch stuck on a failed re-attach would sail through to
+  # the next batch. It now checks the per-item results.
+  ansible.builtin.assert:
+    that:
+      - _fb_batch_not_ready | length == 0
+    fail_msg: >-
+      Batch {{ _fb_batch_index + 1 }}: {{ _fb_batch_not_ready | length }} of
+      {{ _fb_batch | length }} workload(s) did not return to Ready within
+      {{ failback_republish_wait_timeout_seconds }}s:
+      {{ _fb_batch_not_ready | join(', ') }}.
+      STOPPING so the remaining workloads are not disrupted.
+      The usual cause is a volume that will not re-attach on the restored
+      primary. Check the node plugin logs:
+      kubectl logs -n hpe-storage -l app=hpe-csi-node -c hpe-csi-driver
+      If the workloads are merely slow to start, raise
+      failback_republish_wait_timeout_seconds.
+    success_msg: >-
+      Batch {{ _fb_batch_index + 1 }}: all {{ _fb_batch | length }} workload(s)
+      returned to Ready.
+    quiet: true
+
+- name: "Republish | pause between batches"
+  ansible.builtin.pause:
+    seconds: "{{ failback_republish_batch_pause_seconds | int }}"
+  when: failback_republish_batch_pause_seconds | int > 0

@@ -1,0 +1,418 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# ROLE 4b of 7 — reconcile_replication_mapping
+#
+# Reverse the primary/secondary roles recorded in the HPEReplicationMapping CRD
+# so that Kubernetes' view of the topology matches the array's view after the
+# switchover.
+#
+# ============================================================================
+# WHY THIS ROLE EXISTS — read before changing anything here
+# ============================================================================
+#
+# The role mapping lives in the HPEReplicationMapping CRD (storage.hpe.com/v3,
+# cluster-scoped, shortname 'hperpm'):
+#
+#   spec:
+#     rcg_details:          { rcgnames: [...] }
+#     primary_array_details: { name, cpg, secret, secretNamespace }
+#     target_array_details:  { name, cpg, secret, secretNamespace }
+#
+# NOTE: this is a DIFFERENT CRD from HPEReplicationDeviceInfo (v2), which only
+# describes static target-array connection details and carries no role. Editing
+# HPEReplicationDeviceInfo would do nothing at all for failback.
+#
+# THE PROBLEM. The legacy CSP does swap these two blocks — but only as a
+# side-effect of servicing a publish request, in
+# utils/remote_copy_validation.go:844, gated on:
+#
+#   slices.Contains(existingRcgNames, rcgName) &&
+#     GetCanonicalIPAddress(targetSysIP) == GetCanonicalIPAddress(targetArrayDetails.Name) &&
+#     rcgRoleTarget == RC_ROLE_PRIMARY
+#
+# Two consequences follow, and BOTH matter for failback:
+#
+#  (a) The swap only happens when a publish is serviced. During a FAILOVER the
+#      CSI driver republishes automatically, so the mapping is usually — but
+#      not always — corrected. If the pods were never republished (or the
+#      republish predates the failover), the mapping still names the array that
+#      went down as primary.
+#
+#  (b) Even when a publish IS serviced, the swap is skipped whenever that
+#      guard is not satisfied. It is a known-fragile path: any CSP bug there
+#      leaves the mapping stale with no error surfaced anywhere.
+#
+# So by the time we come to fail back, the mapping may be in EITHER state and
+# we cannot assume which. That is why this role runs TWICE — see below.
+#
+# ============================================================================
+# WHY THIS ROLE RUNS TWICE (phase=pre and phase=post)
+# ============================================================================
+#
+# Let O = original primary (went down, we are failing back TO it)
+#     C = current primary  (took over during the outage)
+#
+# The mapping should track the array that is CURRENTLY primary:
+#
+#            array primary   mapping should say
+#   after failover   C            primary=C, target=O
+#   after failback   O            primary=O, target=C
+#
+#   phase=pre   runs BEFORE switchover. Expected state is primary=C. If the
+#               failover swap never happened (case (a)/(b) above) the mapping
+#               still says primary=O, which is STALE AND WRONG — it describes
+#               a topology that has not existed since the outage began. We
+#               repair it to primary=C so the CRD matches the array as it is
+#               right now.
+#
+#   phase=post  runs AFTER switchover, when the array has made O primary again.
+#               Expected end state is primary=O.
+#
+# WHY REPAIR IN PRE AT ALL, GIVEN POST WILL SET IT ANYWAY?
+#
+#   1. Correctness of the switchover window. Between pre and post the array is
+#      still served by C. If anything publishes in that window — a pod
+#      reschedule, a node recovery, a CSI retry — the driver reads the mapping
+#      and would target O, which is the SECONDARY. That is the wrong-array
+#      attach this whole collection exists to prevent.
+#
+#   2. It makes the post-switchover swap a simple, verifiable inversion. If we
+#      let pre stay stale, "swap the two blocks" in post would produce
+#      primary=C — the exact opposite of what we want. A blind swap is only
+#      correct if the starting state is known-good.
+#
+#   3. It surfaces the CSP bug. A pre-phase repair that reports 'REPAIRED'
+#      is direct evidence the failover-time swap did not happen, captured in
+#      the audit record rather than lost.
+#
+# THEREFORE the ordering is:
+#     verify_rcg_sync -> [mapping phase=pre] -> switchover
+#                     -> [mapping phase=post] -> republish_workloads
+#
+# Getting that order wrong is the single most likely way to break a failback,
+# which is why both phases assert their preconditions rather than trusting the
+# playbook to call them correctly.
+#
+# ARRAY IDENTITY. The CRD stores the array MANAGEMENT IP (e.g.
+# "10.132.239.130:443"), NOT the rcopy target name ("s042N-FC"). We compare
+# canonically on IP via fb_original_primary_ip / fb_current_primary_ip, exactly
+# as the CSP does with GetCanonicalIPAddress(). Comparing against
+# failback_*_primary.name is always false and was a real bug here.
+#
+# IDEMPOTENCY. Each phase reads the CRD, compares against the expected owner
+# for that phase, and patches only on disagreement. An already-correct mapping
+# is a no-op, so both phases are safe to re-run.
+
+- name: "Mapping | validate phase argument"
+  ansible.builtin.assert:
+    that:
+      - fb_mapping_phase | default('') in ['pre', 'post']
+    fail_msg: >-
+      reconcile_replication_mapping requires fb_mapping_phase to be 'pre'
+      (before switchover) or 'post' (after switchover), got
+      '{{ fb_mapping_phase | default("<unset>") }}'.
+    quiet: true
+
+- name: "Mapping | skip when disabled"
+  ansible.builtin.debug:
+    msg: >-
+      HPEReplicationMapping reconciliation is DISABLED
+      (failback_reconcile_replication_mapping=false). The CSP will attempt the
+      swap itself on first publish. See the role header for why that is racy.
+  when: not (failback_reconcile_replication_mapping | bool)
+
+- name: "Mapping | reconcile primary/secondary roles ({{ fb_mapping_phase }})"
+  when: failback_reconcile_replication_mapping | bool
+  block:
+
+    # ---------------------------------------------------------------------
+    # Which array should own the mapping in THIS phase?
+    # ---------------------------------------------------------------------
+    - name: "Mapping | determine the expected owner for phase '{{ fb_mapping_phase }}'"
+      # pre  : the array serving I/O right now is the CURRENT primary
+      # post : the switchover has handed the role back to the ORIGINAL primary
+      ansible.builtin.set_fact:
+        fb_rpm_expect_primary_ip: >-
+          {{ fb_current_primary_ip if fb_mapping_phase == 'pre'
+             else fb_original_primary_ip }}
+        fb_rpm_expect_other_ip: >-
+          {{ fb_original_primary_ip if fb_mapping_phase == 'pre'
+             else fb_current_primary_ip }}
+        fb_rpm_expect_primary_label: >-
+          {{ failback_current_primary.name if fb_mapping_phase == 'pre'
+             else failback_original_primary.name }}
+
+    # ---------------------------------------------------------------------
+    # Ordering guard — differs by phase
+    # ---------------------------------------------------------------------
+    - name: "Mapping | assert the switchover has NOT yet happened (pre)"
+      # The pre phase records "C is primary". If the switchover has already run
+      # this is stale the moment we write it.
+      ansible.builtin.assert:
+        that:
+          - not (fb_switchover_completed | default(false) | bool)
+        fail_msg: >-
+          Refusing to run the PRE-switchover mapping repair: the switchover has
+          already completed. Writing primary={{ failback_current_primary.name }}
+          now would record a role the array no longer has. Run phase=post.
+        quiet: true
+      when: fb_mapping_phase == 'pre'
+
+    - name: "Mapping | assert the switchover already happened (post)"
+      # Writing a swapped mapping BEFORE the array has actually reversed its
+      # role would point the driver at an array that is still the secondary.
+      # We would have replaced one inconsistency with a worse one.
+      ansible.builtin.assert:
+        that:
+          - fb_switchover_completed | default(false) | bool or ansible_check_mode
+        fail_msg: >-
+          Refusing to reconcile HPEReplicationMapping: the switchover has not
+          been confirmed. The CRD must only be updated AFTER the array has
+          actually reversed the RCG role, otherwise we would record a role the
+          array does not have.
+        quiet: true
+      when: fb_mapping_phase == 'post'
+
+    # ---------------------------------------------------------------------
+    # Discover the mapping objects that reference our RCG
+    # ---------------------------------------------------------------------
+    - name: "Mapping | fetch all HPEReplicationMapping objects"
+      kubernetes.core.k8s_info:
+        api_version: storage.hpe.com/v3
+        kind: HPEReplicationMapping
+        kubeconfig: "{{ failback_kubeconfig | default(omit, true) }}"
+        context: "{{ failback_kube_context | default(omit, true) }}"
+      register: _fb_rpm_all
+
+    - name: "Mapping | select the objects that contain our RCG"
+      # A single HPEReplicationMapping can carry several RCG names
+      # (spec.rcg_details.rcgnames is a list). We must only touch mappings that
+      # actually reference the group we just switched over — swapping a mapping
+      # for an unrelated RCG would break a workload we were never asked to
+      # touch.
+      ansible.builtin.set_fact:
+        fb_rpm_targets: >-
+          {{ _fb_rpm_all.resources
+             | selectattr('spec.rcg_details.rcgnames', 'defined')
+             | selectattr('spec.rcg_details.rcgnames',
+                          'contains', failback_rcg_name)
+             | list }}
+
+    - name: "Mapping | report what was found"
+      ansible.builtin.debug:
+        msg:
+          - "HPEReplicationMapping objects total     : {{ _fb_rpm_all.resources | length }}"
+          - "Referencing RCG '{{ failback_rcg_name }}': {{ fb_rpm_targets | length }}"
+          - "Names                                   : {{ fb_rpm_targets | map(attribute='metadata.name') | list }}"
+
+    - name: "Mapping | warn if no mapping references this RCG"
+      # Not fatal. A cluster may legitimately have no HPEReplicationMapping if
+      # the CSP version predates it. But it IS worth shouting about, because
+      # the far more likely cause is a mismatched RCG name, and silently doing
+      # nothing here would leave the driver pointed at the wrong array.
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: no HPEReplicationMapping object references RCG
+          '{{ failback_rcg_name }}'. Either this CSP version does not use the
+          v3 mapping CRD, or the RCG name is wrong. The driver may attempt to
+          publish against the old primary. Verify with:
+          kubectl get hperpm -o yaml
+      when: fb_rpm_targets | length == 0
+
+    # ---------------------------------------------------------------------
+    # Determine the desired end state and compare
+    # ---------------------------------------------------------------------
+    - name: "Mapping | reset the plan from any previous phase"
+      # fb_rpm_plan is built by appending in a loop. This role runs twice per
+      # failback, so without an explicit reset the post phase would inherit the
+      # pre phase's entries and patch each mapping twice.
+      ansible.builtin.set_fact:
+        fb_rpm_plan: []
+
+    - name: "Mapping | build the desired role assignment for this phase"
+      # We swap the EXISTING blocks wholesale rather than constructing new ones
+      # from inventory, so that cpg / secret / secretNamespace — which we do not
+      # manage and must not invent — are preserved exactly as the CSP wrote them.
+      #
+      # Comparison is on the canonical IP (host part of the CRD's array name,
+      # which carries a ":443" port), NOT on the rcopy target name. See the
+      # ARRAY IDENTITY note in the role header.
+      ansible.builtin.set_fact:
+        fb_rpm_plan: >-
+          {{ (fb_rpm_plan | default([])) + [{
+               'name': item.metadata.name,
+               'current_primary': item.spec.primary_array_details.name
+                                  | default(''),
+               'current_target': item.spec.target_array_details.name
+                                 | default(''),
+               'current_primary_ip': (item.spec.primary_array_details.name
+                                      | default('')) | regex_replace(':.*$', ''),
+               'current_target_ip': (item.spec.target_array_details.name
+                                     | default('')) | regex_replace(':.*$', ''),
+               'new_primary_block': item.spec.target_array_details,
+               'new_target_block': item.spec.primary_array_details,
+               'rcgnames': item.spec.rcg_details.rcgnames,
+               'needs_swap': ((item.spec.primary_array_details.name
+                               | default('')) | regex_replace(':.*$', ''))
+                             != fb_rpm_expect_primary_ip
+             }] }}
+      loop: "{{ fb_rpm_targets }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: "Mapping | sanity-check the swap direction before writing"
+      # Defence against a mis-set inventory. A swap is only correct if the two
+      # blocks name the two arrays we are actually failing between. If the CRD
+      # references some third array, swapping would scramble the roles rather
+      # than fix them. Fail loudly instead.
+      ansible.builtin.assert:
+        that:
+          - item.current_primary_ip in [fb_original_primary_ip, fb_current_primary_ip]
+          - item.current_target_ip in [fb_original_primary_ip, fb_current_primary_ip]
+          - item.current_primary_ip != item.current_target_ip
+        fail_msg: >-
+          Refusing to swap HPEReplicationMapping '{{ item.name }}'.
+          It maps primary={{ item.current_primary }} target={{ item.current_target }},
+          but this failback is between
+          {{ fb_original_primary_ip }} ({{ failback_original_primary.name }})
+          and {{ fb_current_primary_ip }} ({{ failback_current_primary.name }}).
+          Swapping would record a topology that does not match either array.
+          Check that the wsapi_url values in your inventory match the array IPs
+          the CSP recorded (kubectl get hperpm {{ item.name }} -o yaml).
+        quiet: true
+      loop: "{{ fb_rpm_plan | default([]) | selectattr('needs_swap') | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: "Mapping | report that the failover-time swap did not happen"
+      # Only meaningful in the pre phase. If the mapping still names the array
+      # that WENT DOWN as primary, the CSP never performed the failover-time
+      # swap — either no publish was serviced, or the guard in
+      # remote_copy_validation.go:844 did not fire. Worth recording explicitly:
+      # this is the CSP bug this role exists to compensate for.
+      ansible.builtin.debug:
+        msg: >-
+          STALE MAPPING DETECTED: '{{ item.name }}' still names
+          {{ item.current_primary }} as primary, but that array has not served
+          this RCG since the outage began. The CSP's failover-time swap did not
+          happen (no publish was serviced, or the CSP-side guard did not fire).
+          Repairing to primary={{ fb_rpm_expect_primary_ip }}
+          ({{ fb_rpm_expect_primary_label }}) before the switchover.
+      loop: >-
+        {{ fb_rpm_plan | default([]) | selectattr('needs_swap') | list }}
+      loop_control:
+        label: "{{ item.name }}"
+      when: fb_mapping_phase == 'pre'
+
+    - name: "Mapping | show the reconciliation plan"
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.name }}:
+          {{ ('SWAP  primary ' ~ item.current_primary_ip ~ ' -> '
+              ~ fb_rpm_expect_primary_ip)
+             if item.needs_swap
+             else ('already correct (primary=' ~ item.current_primary_ip ~ ')') }}
+      loop: "{{ fb_rpm_plan | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: "Mapping | DRY RUN — no CRD will be modified"
+      ansible.builtin.debug:
+        msg: >-
+          [check mode] Would patch HPEReplicationMapping/{{ item.name }}:
+          primary_array_details.name
+          {{ item.current_primary }} -> {{ item.new_primary_block.name }};
+          target_array_details.name
+          {{ item.current_target }} -> {{ item.new_target_block.name }}
+      loop: "{{ fb_rpm_plan | default([]) | selectattr('needs_swap') | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: ansible_check_mode
+
+    # ---------------------------------------------------------------------
+    # Apply
+    # ---------------------------------------------------------------------
+    - name: "Mapping | patch the swapped roles into the CRD"
+      # A strategic merge patch on the two blocks only. We deliberately do NOT
+      # replace the whole spec: rcg_details must survive untouched, and a full
+      # replace would drop any field a newer CSP has added that we do not know
+      # about.
+      kubernetes.core.k8s:
+        state: patched
+        api_version: storage.hpe.com/v3
+        kind: HPEReplicationMapping
+        name: "{{ item.name }}"
+        kubeconfig: "{{ failback_kubeconfig | default(omit, true) }}"
+        context: "{{ failback_kube_context | default(omit, true) }}"
+        definition:
+          spec:
+            primary_array_details: "{{ item.new_primary_block }}"
+            target_array_details: "{{ item.new_target_block }}"
+      loop: "{{ fb_rpm_plan | default([]) | selectattr('needs_swap') | list }}"
+      loop_control:
+        label: "{{ item.name }}: {{ item.current_primary }} -> {{ item.new_primary_block.name }}"
+      register: _fb_rpm_patched
+      when: not ansible_check_mode
+
+    # ---------------------------------------------------------------------
+    # Read back and verify
+    # ---------------------------------------------------------------------
+    - name: "Mapping | re-read the CRDs to confirm the swap landed"
+      # Trusting the patch response would only tell us the API server accepted
+      # the request. A validating webhook or a controller reconciling the object
+      # back could silently revert it, and we would then restart workloads
+      # against the wrong array.
+      kubernetes.core.k8s_info:
+        api_version: storage.hpe.com/v3
+        kind: HPEReplicationMapping
+        name: "{{ item.name }}"
+        kubeconfig: "{{ failback_kubeconfig | default(omit, true) }}"
+        context: "{{ failback_kube_context | default(omit, true) }}"
+      loop: "{{ fb_rpm_plan | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: _fb_rpm_verify
+      when: not ansible_check_mode
+
+    - name: "Mapping | assert every mapping now names the expected primary"
+      ansible.builtin.assert:
+        that:
+          - ((item.resources | first).spec.primary_array_details.name
+             | regex_replace(':.*$', '')) == fb_rpm_expect_primary_ip
+        fail_msg: >-
+          HPEReplicationMapping '{{ (item.resources | first).metadata.name }}'
+          still reports primary_array_details.name
+          '{{ (item.resources | first).spec.primary_array_details.name }}',
+          expected IP '{{ fb_rpm_expect_primary_ip }}'
+          ({{ fb_rpm_expect_primary_label }}).
+          DO NOT restart workloads — the driver would publish against the wrong
+          array. Something is reverting the CRD (check for a running CSP
+          reconcile loop or an admission webhook).
+        success_msg: >-
+          {{ (item.resources | first).metadata.name }}: primary is now
+          {{ fb_rpm_expect_primary_ip }} ({{ fb_rpm_expect_primary_label }})
+        quiet: true
+      loop: "{{ _fb_rpm_verify.results | default([]) }}"
+      loop_control:
+        label: "{{ (item.resources | first).metadata.name | default('?') }}"
+      when: not ansible_check_mode
+
+    - name: "Mapping | record facts for the audit record"
+      ansible.builtin.set_fact:
+        # Namespaced per phase so the pre-phase repair count — the evidence
+        # that the CSP's failover swap did not happen — is not overwritten by
+        # the post phase.
+        "fb_mappings_swapped_{{ fb_mapping_phase }}": >-
+          {{ fb_rpm_plan | default([]) | selectattr('needs_swap') | list | length }}
+        fb_mappings_total: "{{ fb_rpm_plan | default([]) | length }}"
+        "fb_mapping_reconcile_{{ fb_mapping_phase }}_done": true
+
+    - name: "Mapping | summary"
+      ansible.builtin.debug:
+        msg:
+          - "Phase                                      : {{ fb_mapping_phase }}"
+          - "HPEReplicationMapping objects for this RCG : {{ fb_mappings_total }}"
+          - "Patched                                    : {{ fb_rpm_plan | default([]) | selectattr('needs_swap') | list | length }}"
+          - "Already correct                            : {{ (fb_mappings_total | int) - (fb_rpm_plan | default([]) | selectattr('needs_swap') | list | length) }}"
+          - "Kubernetes now agrees with the array: primary = {{ fb_rpm_expect_primary_label }} ({{ fb_rpm_expect_primary_ip }})"

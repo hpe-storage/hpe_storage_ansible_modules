@@ -1,0 +1,74 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# Resolve the array-local name of failback_rcg_name on ONE array.
+#
+# Expects:
+#   _fb_array   : array dict
+#   _fb_role    : "original_primary" | "current_primary"
+#   fb_session_<_fb_role> : session key (set by wsapi_login.yml)
+#
+# Sets:
+#   fb_rcg_name_<_fb_role> : the name to use in WSAPI URLs for THIS array
+#
+# WHY THIS EXISTS. A Remote Copy Group does not have the same name on both
+# arrays. The array on which the group was *created* holds it under the plain
+# name; the partner array holds the mirrored group under
+# "<name>.r<serial-of-the-creating-array>". For example:
+#
+#   s042N (10.132.239.130) : kalikiva-rcg
+#   s0452 (10.132.239.141) : kalikiva-rcg.r176404
+#
+# Addressing the partner array with the plain name returns
+# HTTP 404 {"code":187,"desc":"remote copy group does not exist"} — which looks
+# like a configuration typo but is not. So we never hard-code the name into a
+# URL: we look it up per array and cache it per role.
+#
+# We match exactly first, then fall back to the "<name>.r<digits>" form. We
+# deliberately do NOT accept an arbitrary prefix match: "kalikiva-rcg" must not
+# silently resolve to "kalikiva-rcg-test", which would switch over the wrong
+# group.
+
+- name: "RCG | list Remote Copy Groups on {{ _fb_role }}"
+  ansible.builtin.uri:
+    url: "{{ _fb_array.wsapi_url }}{{ wsapi_rcg_path }}"
+    method: GET
+    headers:
+      X-HP3PAR-WSAPI-SessionKey: "{{ lookup('vars', 'fb_session_' ~ _fb_role) }}"
+    status_code: [200]
+    validate_certs: "{{ _fb_array.validate_certs | default(false) }}"
+    use_proxy: "{{ failback_wsapi_use_proxy | default(false) | bool }}"
+    timeout: "{{ failback_wsapi_timeout_seconds | default(30) | int }}"
+  register: _fb_rcg_list
+
+- name: "RCG | select the array-local name for '{{ failback_rcg_name }}' ({{ _fb_role }})"
+  ansible.builtin.set_fact:
+    _fb_rcg_matches: >-
+      {{ _fb_rcg_list.json.members | default([]) | map(attribute='name')
+         | select('match', '^' ~ (failback_rcg_name | regex_escape)
+                         ~ '(\.r[0-9]+)?$')
+         | list }}
+
+- name: "RCG | fail if the group is not present on {{ _fb_role }}"
+  ansible.builtin.fail:
+    msg: >-
+      Remote Copy Group '{{ failback_rcg_name }}' does not exist on
+      {{ _fb_role }} ({{ _fb_array.name | default('unnamed') }}), either under
+      that name or as a mirrored '<name>.r<serial>' group.
+      Check failback_rcg_name against 'showrcopy' on the array.
+  when: _fb_rcg_matches | length == 0
+
+- name: "RCG | cache the resolved name ({{ _fb_role }})"
+  ansible.builtin.set_fact:
+    # Prefer the exact name if this array owns the group; otherwise use the
+    # single mirrored ".r<serial>" variant.
+    "fb_rcg_name_{{ _fb_role }}": >-
+      {{ failback_rcg_name if failback_rcg_name in _fb_rcg_matches
+         else _fb_rcg_matches[0] }}
+
+- name: "RCG | report the resolved name ({{ _fb_role }})"
+  ansible.builtin.debug:
+    msg: >-
+      RCG '{{ failback_rcg_name }}' is known as
+      '{{ lookup('vars', 'fb_rcg_name_' ~ _fb_role) }}' on {{ _fb_role }}
+      ({{ _fb_array.name | default('unnamed') }}).

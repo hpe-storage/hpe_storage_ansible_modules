@@ -1,0 +1,97 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# Read-only preflight. Runs every check the real playbook would run, makes no
+# changes whatsoever, and reports whether a failback would be permitted.
+#
+# Safe to run at any time, including during an outage. Use this to answer
+# "are we ready to fail back yet?" without committing to anything.
+#
+#   ansible-playbook playbooks/preflight.yml
+
+- name: Failback preflight — read-only readiness assessment
+  hosts: localhost
+  gather_facts: true
+  connection: local
+
+  vars:
+    # Force the safe settings regardless of what the inventory says.
+    failback_mode: "off"
+    failback_republish_enabled: false
+
+  roles:
+    - role: hpe.csi_failback.common
+    - role: hpe.csi_failback.detect_recovery
+    - role: hpe.csi_failback.rehydrate_hosts_vluns
+    - role: hpe.csi_failback.verify_rcg_sync
+
+  post_tasks:
+    - name: "Preflight | inspect HPEReplicationMapping role assignment"
+      # Read-only. Shows whether Kubernetes' view of the topology currently
+      # agrees with the array. During an outage a DISAGREEMENT here is expected
+      # and is precisely what the failback will repair.
+      kubernetes.core.k8s_info:
+        api_version: storage.hpe.com/v3
+        kind: HPEReplicationMapping
+        kubeconfig: "{{ failback_kubeconfig | default(omit, true) }}"
+        context: "{{ failback_kube_context | default(omit, true) }}"
+      register: _pf_rpm
+      failed_when: false
+
+    - name: "Preflight | summarise the mapping state"
+      ansible.builtin.set_fact:
+        _pf_rpm_for_rcg: >-
+          {{ _pf_rpm.resources | default([])
+             | selectattr('spec.rcg_details.rcgnames', 'defined')
+             | selectattr('spec.rcg_details.rcgnames',
+                          'contains', failback_rcg_name)
+             | list }}
+
+    - name: "Preflight | report each mapping"
+      # The CRD stores the array MANAGEMENT IP (e.g. "10.132.239.130:443"), not
+      # the rcopy target name, so compare on the host part of wsapi_url.
+      #
+      # Three possible states, and the middle one is the interesting one:
+      #   primary == current  : normal post-failover state, CSP swapped it
+      #   primary == original : STALE — the CSP never swapped it at failover
+      #                         time (no publish serviced, or the CSP-side
+      #                         guard did not fire). Failback repairs this
+      #                         before the switchover.
+      #   neither             : the mapping references some third array
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.metadata.name }}:
+          primary={{ item.spec.primary_array_details.name | default('?') }}
+          target={{ item.spec.target_array_details.name | default('?') }}
+          {{ '(normal post-failover state; will be swapped back during failback)'
+             if ((item.spec.primary_array_details.name | default(''))
+                 | regex_replace(':.*$', '')) == fb_current_primary_ip
+             else ('(STALE — CSP did not swap at failover time; failback will '
+                   ~ 'repair this BEFORE the switchover)')
+                  if ((item.spec.primary_array_details.name | default(''))
+                      | regex_replace(':.*$', '')) == fb_original_primary_ip
+             else '(UNRECOGNISED — references neither failback array)' }}
+      loop: "{{ _pf_rpm_for_rcg }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+
+    - name: "Preflight | verdict"
+      ansible.builtin.debug:
+        msg:
+          - "=============================================================="
+          - "  PREFLIGHT VERDICT: READY TO FAIL BACK"
+          - "=============================================================="
+          - "Original primary recovered : {{ fb_original_primary_recovered | default(false) }}"
+          - "Safety gates passed        : {{ fb_gates_passed | default(false) }}"
+          - "Volumes discovered         : {{ fb_rehydrate_items | default([]) | length }}"
+          - "VLUNs missing (to create)  : {{ fb_vluns_to_create | default([]) | length }}"
+          - "Repl. mappings for this RCG: {{ _pf_rpm_for_rcg | length }}"
+          - "  stale (CSP missed the failover swap; repaired pre-switchover): {{ _pf_rpm_for_rcg
+               | map(attribute='spec.primary_array_details.name')
+               | map('regex_replace', ':.*$', '')
+               | select('equalto', fb_original_primary_ip)
+               | list | length }}"
+          - ""
+          - "Run the real failback with:"
+          - "  ansible-playbook playbooks/failback.yml -e failback_mode=automatic"
+          - "=============================================================="

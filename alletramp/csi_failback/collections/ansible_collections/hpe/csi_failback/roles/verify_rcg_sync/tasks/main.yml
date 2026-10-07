@@ -1,0 +1,211 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# ROLE 3 of 6 — verify_rcg_sync
+#
+# THIS IS THE HARD GATE. Nothing downstream runs unless every assertion here
+# passes. The role is intentionally read-only.
+#
+# WHY IT MATTERS. A switchover reverses the replication direction. If the RCG
+# is not fully synchronized at that moment, the array promotes a target that is
+# behind the source — silent data loss, and the workload comes back on stale
+# blocks. Every manual-failback incident we have seen that ended badly ended
+# badly here. So: verify, and ABORT rather than proceed on a maybe.
+#
+# We deliberately do NOT offer a "force" flag. If an operator genuinely needs to
+# switch over an unsynced group, that is a considered human decision made with
+# the array CLI, not something automation should make easy.
+
+- name: "Verify | login to current primary"
+  ansible.builtin.include_role:
+    name: hpe.csi_failback.common
+    tasks_from: wsapi_login.yml
+  vars:
+    _fb_array: "{{ failback_current_primary }}"
+    _fb_role: current_primary
+
+- name: "Verify | resolve the array-local RCG name on the current primary"
+  ansible.builtin.include_role:
+    name: hpe.csi_failback.common
+    tasks_from: wsapi_resolve_rcg.yml
+  vars:
+    _fb_array: "{{ failback_current_primary }}"
+    _fb_role: current_primary
+
+- name: "Verify | read RCG state from the current primary"
+  ansible.builtin.uri:
+    url: >-
+      {{ failback_current_primary.wsapi_url }}{{ wsapi_rcg_path }}/{{ fb_rcg_name_current_primary }}
+    method: GET
+    headers:
+      X-HP3PAR-WSAPI-SessionKey: "{{ fb_session_current_primary }}"
+    status_code: [200]
+    validate_certs: "{{ failback_current_primary.validate_certs }}"
+    use_proxy: "{{ failback_wsapi_use_proxy | default(false) | bool }}"
+    timeout: 30
+  register: fb_rcg
+
+- name: "Verify | extract RCG facts"
+  ansible.builtin.set_fact:
+    fb_rcg_role: "{{ fb_rcg.json.role | default(0) }}"
+    # WSAPI returns rcopyGroupRoleEnum as an integer (1=PRIMARY, 2=SECONDARY).
+    # Keep the raw value for comparisons and a label for humans.
+    fb_rcg_role_label: >-
+      {{ 'PRIMARY' if (fb_rcg.json.role | default(0) | int) == wsapi_rcg_role_primary
+         else 'SECONDARY' if (fb_rcg.json.role | default(0) | int) == wsapi_rcg_role_secondary
+         else 'UNKNOWN(' ~ (fb_rcg.json.role | default('none')) ~ ')' }}
+    fb_rcg_targets: "{{ fb_rcg.json.targets | default([]) }}"
+    fb_rcg_volumes: "{{ fb_rcg.json.volumes | default([]) }}"
+
+- name: "Verify | show RCG state"
+  ansible.builtin.debug:
+    msg:
+      - "RCG                : {{ failback_rcg_name }}"
+      - "Role (current prim): {{ fb_rcg_role_label }}"
+      - "Volume count       : {{ fb_rcg_volumes | length }}"
+      - "Targets            : {{ fb_rcg_targets | map(attribute='targetName') | list }}"
+
+# --- Gate 1: the group must actually be started -----------------------------
+- name: "Verify | GATE 1 — RCG must be started"
+  ansible.builtin.assert:
+    that:
+      - fb_rcg_targets | length > 0
+      - fb_rcg_targets | selectattr('state', 'defined')
+        | selectattr('state', 'equalto', 3) | list | length > 0
+    fail_msg: >-
+      GATE 1 FAILED: RCG '{{ failback_rcg_name }}' is not in the STARTED state
+      on the current primary. Target states=
+      {{ fb_rcg_targets | map(attribute='state') | list }}.
+      A stopped group cannot be switched over. Start it and re-run.
+    success_msg: "GATE 1 PASSED: RCG is started."
+    quiet: true
+
+# --- Gate 2: every volume must be fully synchronized ------------------------
+- name: "Verify | wait for all volumes to reach the synced state"
+  # We poll rather than sampling once: after rehydration the group is often
+  # mid-resync, and waiting a few minutes is exactly what we want the
+  # automation to do on the operator's behalf.
+  ansible.builtin.uri:
+    url: >-
+      {{ failback_current_primary.wsapi_url }}{{ wsapi_rcg_path }}/{{ fb_rcg_name_current_primary }}
+    method: GET
+    headers:
+      X-HP3PAR-WSAPI-SessionKey: "{{ fb_session_current_primary }}"
+    status_code: [200]
+    validate_certs: "{{ failback_current_primary.validate_certs }}"
+    use_proxy: "{{ failback_wsapi_use_proxy | default(false) | bool }}"
+    timeout: 30
+  register: _fb_sync_poll
+  until: >-
+    (_fb_sync_poll.json.volumes | default([])
+      | selectattr('syncStatus', 'defined')
+      | rejectattr('syncStatus', 'equalto', 3)
+      | list | length) == 0
+  retries: "{{ (failback_task_timeout_seconds | int)
+               // (failback_task_poll_interval_seconds | int) }}"
+  delay: "{{ failback_task_poll_interval_seconds | int }}"
+  failed_when: false
+
+- name: "Verify | count volumes that are not synchronized"
+  ansible.builtin.set_fact:
+    fb_unsynced_volumes: >-
+      {{ _fb_sync_poll.json.volumes | default([])
+         | selectattr('syncStatus', 'defined')
+         | rejectattr('syncStatus', 'equalto', 3)
+         | map(attribute='name') | list }}
+
+- name: "Verify | GATE 2 — every volume must be synchronized"
+  ansible.builtin.assert:
+    that:
+      - fb_unsynced_volumes | length == 0
+    fail_msg: >-
+      GATE 2 FAILED: {{ fb_unsynced_volumes | length }} volume(s) in RCG
+      '{{ failback_rcg_name }}' are NOT synchronized:
+      {{ fb_unsynced_volumes | join(', ') }}.
+      SWITCHOVER ABORTED. Switching over now would promote a target that is
+      behind the source and silently lose the delta. Let the resync finish
+      (showrcopy -d {{ failback_rcg_name }}) and re-run this playbook.
+    success_msg: >-
+      GATE 2 PASSED: all {{ fb_rcg_volumes | length }} volumes synchronized.
+    quiet: true
+
+# --- Gate 3: quorum witness must be healthy ---------------------------------
+- name: "Verify | read Remote Copy targets for quorum witness state"
+  ansible.builtin.uri:
+    url: "{{ failback_current_primary.wsapi_url }}/api/v1/remotecopytargets"
+    method: GET
+    headers:
+      X-HP3PAR-WSAPI-SessionKey: "{{ fb_session_current_primary }}"
+    status_code: [200]
+    validate_certs: "{{ failback_current_primary.validate_certs }}"
+    use_proxy: "{{ failback_wsapi_use_proxy | default(false) | bool }}"
+    timeout: 30
+  register: _fb_rc_targets
+  when: failback_require_quorum_witness | bool
+
+- name: "Verify | extract the quorum status for the failback target"
+  ansible.builtin.set_fact:
+    _fb_quorum_status: >-
+      {{ _fb_rc_targets.json.members | default([])
+         | selectattr('name', 'equalto', failback_original_primary.name)
+         | selectattr('quorumStatus', 'defined')
+         | map(attribute='quorumStatus') | list }}
+  when: failback_require_quorum_witness | bool
+
+- name: "Verify | GATE 3 — quorum witness must be up"
+  # APP requires a third site for quorum. Switching over while the witness is
+  # down risks a split-brain decision with no arbiter. If the customer has
+  # explicitly disabled this check, we honour it but say so.
+  #
+  # WSAPI "Quorum status enumeration" (Remote Copy chapter, p.273):
+  #   1 UNINITIALIZED   2 INITIALIZING   3 STANDBY   4 ACTIVE
+  #   5 FAILSAFE        6 FAILOVER       7 RESTARTING   99 UNKNOWN
+  #
+  # HEALTHY means ACTIVE (4) — the witness is running and arbitrating — or
+  # STANDBY (3), where it is up and reachable but not currently the deciding
+  # party. Everything else is a refusal:
+  #   UNINITIALIZED/INITIALIZING => never came up, no arbiter exists
+  #   FAILSAFE/FAILOVER          => the witness is already handling a split
+  #   RESTARTING/UNKNOWN         => transient or unreadable; do not gamble
+  #
+  # NOTE: an earlier revision asserted quorumStatus == 1, which is
+  # UNINITIALIZED — the gate passed only when the witness was NOT working, and
+  # failed on a perfectly healthy ACTIVE witness. Do not "simplify" this back.
+  ansible.builtin.assert:
+    that:
+      - _fb_quorum_status | length > 0
+      - _fb_quorum_status | select('in', wsapi_quorum_healthy_states)
+        | list | length == (_fb_quorum_status | length)
+    fail_msg: >-
+      GATE 3 FAILED: the quorum witness is not reporting a healthy state for
+      target '{{ failback_original_primary.name }}'.
+      quorumStatus={{ _fb_quorum_status | default('<target not found>') }}
+      (healthy = {{ wsapi_quorum_healthy_states }} i.e. STANDBY/ACTIVE;
+      1=UNINITIALIZED 2=INITIALIZING 3=STANDBY 4=ACTIVE 5=FAILSAFE
+      6=FAILOVER 7=RESTARTING 99=UNKNOWN).
+      Active Peer Persistence requires a functioning third-site witness before
+      a role reversal. SWITCHOVER ABORTED. Set
+      failback_require_quorum_witness=false only if you have independently
+      confirmed the witness state.
+    success_msg: >-
+      GATE 3 PASSED: quorum witness healthy
+      (quorumStatus={{ _fb_quorum_status | join(',') }}).
+    quiet: true
+  when: failback_require_quorum_witness | bool
+
+- name: "Verify | note that the quorum gate was skipped"
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: quorum witness verification was SKIPPED because
+      failback_require_quorum_witness=false. Proceeding without an arbiter check.
+  when: not (failback_require_quorum_witness | bool)
+
+- name: "Verify | all gates passed"
+  ansible.builtin.set_fact:
+    fb_gates_passed: true
+
+- name: "Verify | announce"
+  ansible.builtin.debug:
+    msg: >-
+      ALL SAFETY GATES PASSED. RCG '{{ failback_rcg_name }}' is eligible for
+      switchover back to '{{ failback_original_primary.name }}'.

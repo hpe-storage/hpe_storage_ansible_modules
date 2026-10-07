@@ -1,0 +1,49 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# Discover the PersistentVolumes belonging to failback_rcg_name.
+#
+# Sets:
+#   fb_target_volumes : list of PV resources for this RCG
+#
+# WHY THIS IS SHARED. Both rehydrate_hosts_vluns (to work out which VLUNs to
+# recreate) and republish_workloads (to work out which PVCs, and therefore
+# which workloads, are affected) need exactly the same set of PVs.
+#
+# It originally lived only in rehydrate_hosts_vluns, and republish_workloads
+# just read the fact it left behind. That coupling is invisible until you run
+# the roles independently — the post-switchover resume path skips rehydration,
+# and republish then died with "'fb_target_volumes' is undefined". Discovery
+# that every consumer can perform for itself removes the ordering dependency
+# altogether.
+#
+# CORRELATION KEY. The link from a Kubernetes PV to the array's Remote Copy
+# group is the volumeAttributes.remoteCopyGroup entry the CSP writes at
+# provisioning time. We filter on it so that failing back one RCG never
+# disturbs volumes belonging to another.
+
+- name: "Discover | fetch PersistentVolumes"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolume
+    kubeconfig: "{{ failback_kubeconfig | default(omit, true) }}"
+    context: "{{ failback_kube_context | default(omit, true) }}"
+  register: _fb_pvs
+
+- name: "Discover | correlate PVs with the RCG under management"
+  ansible.builtin.set_fact:
+    fb_target_volumes: >-
+      {{ _fb_pvs.resources
+         | selectattr('spec.csi', 'defined')
+         | selectattr('spec.csi.driver', 'equalto', failback_csi_driver_name)
+         | selectattr('spec.csi.volumeAttributes.remoteCopyGroup',
+                      'defined')
+         | selectattr('spec.csi.volumeAttributes.remoteCopyGroup',
+                      'equalto', failback_rcg_name)
+         | list }}
+
+- name: "Discover | report"
+  ansible.builtin.debug:
+    msg: >-
+      Discovered {{ fb_target_volumes | length }} PersistentVolume(s) for RCG
+      '{{ failback_rcg_name }}' via driver '{{ failback_csi_driver_name }}'.

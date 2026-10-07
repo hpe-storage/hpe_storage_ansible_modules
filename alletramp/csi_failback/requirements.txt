@@ -1,0 +1,5 @@
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+ansible-core>=2.15,<2.18
+kubernetes>=28.1.0
+PyYAML>=6.0
+jsonpatch>=1.33

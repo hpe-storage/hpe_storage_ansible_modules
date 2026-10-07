@@ -1,0 +1,205 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# Defaults shared by every hpe.csi_failback role. Override in inventory,
+# group_vars, or via -e on the command line.
+
+# ---------------------------------------------------------------------------
+# Remote Copy group under management
+# ---------------------------------------------------------------------------
+# Name of the Remote Copy Group (RCG) whose volumes are to be failed back.
+failback_rcg_name: ""
+
+# ---------------------------------------------------------------------------
+# Arrays
+#
+# NOTE ON NAMING. Throughout this collection "original primary" means the array
+# that owned the RCG *before* the outage and that we are failing BACK to. It is
+# currently the SECONDARY because failover swapped the roles. "current primary"
+# is the array that took over during the outage (the original secondary).
+#
+# This naming trips people up constantly, so every task that touches an array
+# says explicitly which one it means.
+# ---------------------------------------------------------------------------
+failback_original_primary:
+  name: ""          # array name as known to Remote Copy (rcopy target name)
+  wsapi_url: ""     # e.g. https://10.0.0.10:443
+  username: ""
+  password: ""
+  validate_certs: false
+
+failback_current_primary:
+  name: ""
+  wsapi_url: ""
+  username: ""
+  password: ""
+  validate_certs: false
+
+# ---------------------------------------------------------------------------
+# Policy — mirrors the future HPEFailbackPolicy CRD spec
+# ---------------------------------------------------------------------------
+# automatic : run the whole sequence unattended
+# approval  : run every read-only/safe step, then stop before switchover and
+#             print exactly what WOULD happen. Default, deliberately.
+# off       : detect and report only
+failback_mode: approval
+
+# Derived: may this run write to the arrays at all?
+#
+# Two independent brakes, either of which forbids mutation:
+#   --check            : Ansible's own dry-run
+#   failback_mode=off  : detect-and-report only, used by preflight.yml
+#
+# WHY THIS EXISTS. VLUN rehydration used to be gated on `ansible_check_mode`
+# ALONE. preflight.yml sets failback_mode=off but does not pass --check, so a
+# "read-only readiness assessment" would happily POST new VLUNs to the array.
+# The README promises preflight "makes no changes whatsoever"; this variable is
+# what makes that true. Roles must gate every mutating call on it.
+#
+# NOTE the mode names are not symmetric: `approval` DOES rehydrate VLUNs (that
+# is intentional and documented — it is idempotent and non-disruptive), and
+# stops only before the switchover. Only `off` forbids array writes outright.
+failback_may_mutate_arrays: >-
+  {{ (not ansible_check_mode) and (failback_mode != 'off') }}
+
+# Array must be continuously healthy for this long before we trust it.
+# Prevents flapping arrays from triggering a switchover storm.
+failback_min_stable_window_seconds: 600
+
+# How long detect_recovery keeps probing before giving up.
+failback_detect_timeout_seconds: 1800
+failback_detect_interval_seconds: 15
+
+# Hard gate: refuse to switch over unless the RCG reports this state.
+failback_required_sync_state: "Synced"
+failback_require_quorum_witness: true
+
+# Bound every array task poll.
+failback_task_timeout_seconds: 900
+failback_task_poll_interval_seconds: 5
+
+# ---------------------------------------------------------------------------
+# WSAPI HTTP transport
+#
+# Arrays live on the management LAN and are ALWAYS reached directly. If the
+# control node has http_proxy/https_proxy exported (common on corporate
+# workstations and jump hosts), Ansible's `uri` module inherits them and tries
+# to CONNECT to the array through the corporate proxy, which cannot route to
+# the storage network. The symptom is a TLS handshake timeout reported as:
+#
+#   status -1: <urlopen error _ssl.c:990: The handshake operation timed out>
+#
+# no_proxy does NOT save you here: Python's urllib matches no_proxy by
+# hostname/suffix only and silently ignores CIDR entries such as 10.0.0.0/8,
+# so an array addressed by IP is still proxied.
+#
+# We therefore bypass the proxy for all array traffic by default. Set to true
+# only if your arrays genuinely sit behind an HTTP proxy.
+failback_wsapi_use_proxy: false
+
+# Per-request timeout for WSAPI calls.
+failback_wsapi_timeout_seconds: 30
+
+# ---------------------------------------------------------------------------
+# Replication mapping reconciliation
+#
+# After a switchover the array has reversed the RCG role, but the
+# HPEReplicationMapping CRD (storage.hpe.com/v3) still records the OLD
+# primary/target assignment. The CSI driver reads that CRD to decide which
+# array to publish against, so leaving it stale makes the driver attempt the
+# publish on the wrong side.
+#
+# The legacy CSP does swap it, but only lazily as a side-effect of servicing a
+# publish — which is exactly the request that needs the corrected value. We
+# therefore reconcile it explicitly between switchover and republish.
+#
+# Set to false only if you have confirmed your CSP version reconciles the
+# mapping eagerly.
+# ---------------------------------------------------------------------------
+failback_reconcile_replication_mapping: true
+
+# ---------------------------------------------------------------------------
+# Workload republish
+# ---------------------------------------------------------------------------
+# Restart workloads in batches so PodDisruptionBudgets are respected and we
+# never take an entire StatefulSet down at once.
+failback_republish_enabled: true
+failback_republish_batch_size: 1
+failback_republish_batch_pause_seconds: 30
+
+# WHICH pods get restarted.
+#
+#   outage : (default) restart ONLY the workloads whose pods were (re)published
+#            while the original primary was down. Those are the pods whose
+#            volumes the CSI driver could map only on the surviving array, so
+#            they hold a single-sided path and need a re-attach to see the
+#            restored primary. Pods that were already running BEFORE the outage
+#            still have paths to both arrays (Active Peer Persistence) and are
+#            left untouched — restarting them buys nothing and costs downtime.
+#
+#            Membership is decided from the array, not guessed: a (volume,node)
+#            pair that rehydrate_hosts_vluns found WITHOUT a VLUN on the
+#            original primary can only have been attached during the outage.
+#            Optionally widened by failback_outage_start_time below.
+#
+#   all    : legacy behaviour — restart every workload using a PVC in the RCG.
+failback_republish_scope: outage
+
+# Optional. ISO-8601 UTC timestamp (same shape Kubernetes uses, e.g.
+# "2026-10-05T04:46:11Z") of when the original primary went down. When set,
+# any pod in the RCG created at or after this instant is ALSO restarted, even
+# if its VLUN already existed on the original primary (for example because an
+# earlier, aborted run already created it). Leave empty to rely solely on the
+# VLUN-based detection.
+failback_outage_start_time: ""
+
+# How long to wait for a batch's pods to return to Ready before giving up.
+#
+# This is the dominant contributor to the gap between batches: the pause above
+# only starts once the batch is Ready (or this timeout expires). A pod that is
+# genuinely stuck — the usual cause being a volume that will not re-attach on
+# the restored primary — burns the whole timeout before we stop.
+#
+# 120s is a deliberate trade-off. Re-attach after a role reversal is normally
+# seconds: the VLUN already exists (rehydrate_hosts_vluns created it before the
+# switchover) and the node plugin only has to rescan and remount. Two minutes
+# leaves generous headroom for image pulls and slow initContainers while
+# surfacing a genuine attach failure quickly, instead of stalling the run for
+# ten minutes per batch.
+#
+# Raise this if your workloads have long readinessProbe initialDelaySeconds or
+# heavyweight startup, since we wait for READY, not merely Running.
+failback_republish_wait_timeout_seconds: 120
+
+# Namespaces to consider. Empty list == all namespaces.
+failback_namespaces: []
+
+# ---------------------------------------------------------------------------
+# VLUN rehydration
+# ---------------------------------------------------------------------------
+# The CSI driver exports one Host-Sees VLUN per volume/host. We recreate with
+# autoLun so the array assigns the LUN; we then READ BACK the assigned LUN from
+# the ACTIVE vlun rows. We never fabricate or guess a LUN — a wrong LUN makes
+# the node plugin rescan the wrong device.
+failback_vlun_auto_lun: true
+failback_vlun_lun_range_floor: 0
+failback_vlun_lun_range_max: 0     # 0 == no max
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+failback_report_dir: "{{ playbook_dir }}/../reports"
+failback_emit_k8s_events: true
+# Namespace the FailbackCompleted Event is written to. Defaults to the CSI
+# driver's namespace. The in-cluster Helm chart sets this to the release
+# namespace so the Role granting `events: create` and the Event agree.
+failback_event_namespace: hpe-storage
+
+# ---------------------------------------------------------------------------
+# Kubernetes access
+# ---------------------------------------------------------------------------
+failback_kubeconfig: "{{ lookup('env', 'KUBECONFIG') | default(omit, true) }}"
+failback_kube_context: ""
+
+# CSI driver name used to filter VolumeAttachments / PVs.
+failback_csi_driver_name: "csi.hpe.com"

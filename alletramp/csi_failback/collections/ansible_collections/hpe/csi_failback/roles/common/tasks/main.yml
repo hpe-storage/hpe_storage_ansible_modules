@@ -1,0 +1,4 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+# The common role carries the shared defaults; an empty main.yml here keeps
+# Ansible happy while every role inherits configuration from group_vars.

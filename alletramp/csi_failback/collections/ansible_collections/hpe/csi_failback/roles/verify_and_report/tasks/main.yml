@@ -1,0 +1,376 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# ROLE 6 of 6 — verify_and_report
+#
+# Prove the failback actually worked, measure how long it took, and emit an
+# audit record. Read-only.
+#
+# WHY A SEPARATE VERIFICATION PASS. Each preceding role verified its own step,
+# but "every step succeeded" is not the same claim as "the system is in the
+# desired end state". This role re-derives the end state from scratch, from
+# both the array and Kubernetes, so the report is evidence rather than a replay
+# of our own optimism.
+
+- name: "Report | re-login to original primary"
+  ansible.builtin.include_role:
+    name: hpe.csi_failback.common
+    tasks_from: wsapi_login.yml
+  vars:
+    _fb_array: "{{ failback_original_primary }}"
+    _fb_role: original_primary
+
+- name: "Report | re-resolve the array-local RCG name on the original primary"
+  # The name can CHANGE across a switchover: after the role reverses, the array
+  # that now owns the group may hold it under the plain name where it
+  # previously held the mirrored '.r<serial>' variant. Re-resolve rather than
+  # reusing the value cached before the switchover.
+  ansible.builtin.include_role:
+    name: hpe.csi_failback.common
+    tasks_from: wsapi_resolve_rcg.yml
+  vars:
+    _fb_array: "{{ failback_original_primary }}"
+    _fb_role: original_primary
+
+- name: "Report | read final RCG state"
+  ansible.builtin.uri:
+    url: >-
+      {{ failback_original_primary.wsapi_url }}{{ wsapi_rcg_path }}/{{ fb_rcg_name_original_primary }}
+    method: GET
+    headers:
+      X-HP3PAR-WSAPI-SessionKey: "{{ fb_session_original_primary }}"
+    status_code: [200]
+    validate_certs: "{{ failback_original_primary.validate_certs }}"
+    use_proxy: "{{ failback_wsapi_use_proxy | default(false) | bool }}"
+    timeout: 30
+  register: _fb_final_rcg
+
+- name: "Report | read final VLUN state"
+  ansible.builtin.uri:
+    url: "{{ failback_original_primary.wsapi_url }}{{ wsapi_vluns_path }}"
+    method: GET
+    headers:
+      X-HP3PAR-WSAPI-SessionKey: "{{ fb_session_original_primary }}"
+    status_code: [200]
+    validate_certs: "{{ failback_original_primary.validate_certs }}"
+    use_proxy: "{{ failback_wsapi_use_proxy | default(false) | bool }}"
+    timeout: 60
+  register: _fb_final_vluns
+  # Array-wide VLUN table; filtered to this RCG below. Never echo it.
+  no_log: true
+
+- name: "Report | collect the array volume names that belong to this RCG"
+  # The RCG object lists its member volumes by their ARRAY names (already
+  # truncated), so this is the exact key to filter the array-wide VLUN table.
+  ansible.builtin.set_fact:
+    fb_final_rcg_volume_names: >-
+      {{ _fb_final_rcg.json.volumes | default([])
+         | map(attribute='name') | list }}
+
+- name: "Report | read final VolumeAttachment state"
+  kubernetes.core.k8s_info:
+    api_version: storage.k8s.io/v1
+    kind: VolumeAttachment
+    kubeconfig: "{{ failback_kubeconfig | default(omit, true) }}"
+    context: "{{ failback_kube_context | default(omit, true) }}"
+  register: _fb_final_vattach
+
+- name: "Report | read final HPEReplicationMapping state"
+  kubernetes.core.k8s_info:
+    api_version: storage.hpe.com/v3
+    kind: HPEReplicationMapping
+    kubeconfig: "{{ failback_kubeconfig | default(omit, true) }}"
+    context: "{{ failback_kube_context | default(omit, true) }}"
+  register: _fb_final_rpm
+  failed_when: false
+
+- name: "Report | compute verification facts"
+  ansible.builtin.set_fact:
+    fb_final_role: "{{ _fb_final_rcg.json.role | default(0) }}"
+    # Human-readable form for the report and for failure messages: printing
+    # the bare enum ("1"/"2") to an operator during an incident is useless.
+    fb_final_role_label: >-
+      {{ 'PRIMARY' if (_fb_final_rcg.json.role | default(0) | int) == wsapi_rcg_role_primary
+         else 'SECONDARY' if (_fb_final_rcg.json.role | default(0) | int) == wsapi_rcg_role_secondary
+         else 'UNKNOWN(' ~ (_fb_final_rcg.json.role | default('none')) ~ ')' }}
+    fb_final_active_vluns: >-
+      {{ _fb_final_vluns.json.members | default([])
+         | selectattr('active', 'defined')
+         | selectattr('active', 'equalto', true)
+         | selectattr('volumeName', 'in', fb_final_rcg_volume_names)
+         | list | length }}
+    fb_final_attached: >-
+      {{ _fb_final_vattach.resources
+         | selectattr('spec.attacher', 'equalto', failback_csi_driver_name)
+         | selectattr('status.attached', 'defined')
+         | selectattr('status.attached', 'equalto', true)
+         | list | length }}
+    fb_final_unsynced: >-
+      {{ _fb_final_rcg.json.volumes | default([])
+         | selectattr('syncStatus', 'defined')
+         | rejectattr('syncStatus', 'equalto', 3)
+         | map(attribute='name') | list }}
+    fb_final_stale_mappings: >-
+      {{ _fb_final_rpm.resources | default([])
+         | selectattr('spec.rcg_details.rcgnames', 'defined')
+         | selectattr('spec.rcg_details.rcgnames',
+                      'contains', failback_rcg_name)
+         | rejectattr('spec.primary_array_details.name', 'match',
+                      '^' ~ (fb_original_primary_ip | regex_escape) ~ '(:[0-9]+)?$')
+         | map(attribute='metadata.name') | list }}
+
+- name: "Report | compute elapsed failback time (RTO)"
+  ansible.builtin.set_fact:
+    fb_rto_seconds: >-
+      {{ (ansible_date_time.epoch | int)
+         - (fb_switchover_epoch | default(ansible_date_time.epoch) | int) }}
+
+# --- Final assertions -------------------------------------------------------
+
+- name: "Report | VERIFY 1 — original primary owns the RCG"
+  ansible.builtin.assert:
+    that:
+      # rcopyGroupRoleEnum is an INTEGER in the WSAPI response
+      # ("role": 1 == PRIMARY, 2 == SECONDARY), never a string.
+      - (fb_final_role | int) == wsapi_rcg_role_primary
+    fail_msg: >-
+      VERIFICATION FAILED: '{{ failback_original_primary.name }}' reports role
+      '{{ fb_final_role_label }}', expected PRIMARY.
+    success_msg: "VERIFY 1 PASSED: original primary owns the RCG."
+    quiet: true
+
+- name: "Report | VERIFY 2 — replication is healthy again"
+  ansible.builtin.assert:
+    that:
+      - fb_final_unsynced | length == 0
+    fail_msg: >-
+      VERIFICATION FAILED: {{ fb_final_unsynced | length }} volume(s) are not
+      synchronized after failback: {{ fb_final_unsynced | join(', ') }}.
+      The workload is running but is NOT protected. Investigate before
+      declaring the failback complete.
+    success_msg: "VERIFY 2 PASSED: all volumes synchronized."
+    quiet: true
+
+- name: "Report | VERIFY 3 — every discovered volume is attached"
+  # Expected count comes from rehydrate_hosts_vluns when the full playbook ran.
+  # On the post-switchover resume path that role is skipped, so fall back to
+  # the PV count for this RCG — otherwise the expected figure defaults to 0 and
+  # the assertion passes vacuously, which would report success without having
+  # checked anything.
+  ansible.builtin.set_fact:
+    fb_expected_attached: >-
+      {{ [(fb_rehydrate_items | default([]) | length),
+          (fb_target_volumes | default([]) | length)] | max }}
+
+- name: "Report | VERIFY 3 — assert the volumes re-attached"
+  ansible.builtin.assert:
+    that:
+      - fb_final_attached | int >= (fb_expected_attached | int)
+    fail_msg: >-
+      VERIFICATION FAILED: only {{ fb_final_attached }} VolumeAttachments are
+      attached, expected at least {{ fb_expected_attached }}.
+      Some workloads did not re-attach on the restored primary.
+    success_msg: >-
+      VERIFY 3 PASSED: {{ fb_final_attached }} volumes attached
+      (expected at least {{ fb_expected_attached }}).
+    quiet: true
+
+# ---------------------------------------------------------------------------
+# VERIFY 5 — every RCG volume actually has a VLUN on the restored primary
+# ---------------------------------------------------------------------------
+# The counts in VERIFY 3 are aggregate and can hide a single missing mapping.
+# A volume with no VLUN on the array that now owns the group has NO PATH: the
+# workload starts, the mount fails or silently serves nothing, and every other
+# check here still reports green. That is exactly what happened to a PVC
+# provisioned while the original primary was down — Remote Copy replicated the
+# volume, but no VLUN was ever created for it on that side.
+#
+# We therefore check per-volume, by name, against the ACTIVE VLUN rows.
+
+- name: "Report | index ACTIVE VLUN volume names on the restored primary"
+  # 'volumeName' is filtered for DEFINED before mapping. WSAPI does not
+  # guarantee every row carries it — a row mid-creation, or one whose volume
+  # has just been removed, comes back without the key, and map(attribute=...)
+  # then aborts the whole play with "'dict object' has no attribute
+  # 'volumeName'". A missing name simply means "this row proves nothing", so
+  # dropping it is both safe and strictly more robust than indexing blind.
+  ansible.builtin.set_fact:
+    fb_active_vlun_volumes: >-
+      {{ _fb_final_vluns.json.members | default([])
+         | selectattr('active', 'defined')
+         | selectattr('active', 'equalto', true)
+         | selectattr('volumeName', 'defined')
+         | map(attribute='volumeName') | list | unique }}
+
+- name: "Report | list volumes for this RCG lacking a VLUN on the restored primary"
+  # Matched by PREFIX, not equality. The array truncates CSI volume names, so
+  # PV 'pvc-236a1263-4b12-4c19-942e-e1fde5320ea6' is exported as VLUN
+  # 'pvc-236a1263-4b12-4c19-942e-e1f'. An equality test would find no match for
+  # ANY volume and fail VERIFY 5 even on a perfectly rehydrated array — the
+  # same truncation that broke VLUN creation.
+  #
+  # select('in', name) keeps the VLUN names contained in the PV name; if that
+  # list is empty, nothing exports this volume.
+  ansible.builtin.set_fact:
+    fb_volumes_without_vlun: >-
+      {{ (fb_volumes_without_vlun | default([]))
+         + ([item] if (fb_active_vlun_volumes
+                       | select('in', item) | list | length) == 0 else []) }}
+  loop: >-
+    {{ fb_target_volumes | default([])
+       | map(attribute='spec.csi.volumeAttributes.volumeName', default='')
+       | reject('equalto', '') | list }}
+  loop_control:
+    label: "{{ item }}"
+
+- name: "Report | VERIFY 5 — no RCG volume is left without a VLUN"
+  vars:
+    # The loop above only defines the fact when it runs at least once. Default
+    # it here so an RCG with no PVs asserts cleanly instead of erroring on an
+    # undefined variable.
+    _fb_no_vlun: "{{ fb_volumes_without_vlun | default([]) }}"
+  ansible.builtin.assert:
+    that:
+      - _fb_no_vlun | length == 0
+    fail_msg: >-
+      VERIFICATION FAILED: {{ _fb_no_vlun | length }} volume(s) in
+      RCG '{{ failback_rcg_name }}' have NO active VLUN on
+      '{{ failback_original_primary.name }}':
+      {{ _fb_no_vlun | join(', ') }}.
+      These volumes are replicated but not exported, so the workloads using
+      them have no path to their data even though the switchover succeeded.
+      This is the expected symptom for a PVC created while the original primary
+      was down. Re-run rehydration against the restored primary:
+      ansible-playbook playbooks/failback_resume.yml -e failback_mode=automatic
+      then confirm with: showvlun -v <volume>
+    success_msg: >-
+      VERIFY 5 PASSED: all {{ fb_target_volumes | default([]) | length }}
+      RCG volume(s) have an active VLUN on the restored primary.
+    quiet: true
+
+- name: "Report | VERIFY 4 — Kubernetes and the array agree on who is primary"
+  # The most insidious post-failback state is one where the array has handed
+  # the role back but the CRD still names the old primary. Everything looks
+  # healthy until the next publish — a pod reschedule, a node drain, a scale-up
+  # — silently targets the wrong array. We assert the two views match.
+  #
+  # IDENTITY. The CRD records the array MANAGEMENT IP with a port
+  # ("10.132.239.130:443"), NOT the rcopy target name ("s042N-FC"). Comparing
+  # against failback_original_primary.name is therefore false even when the
+  # mapping is perfectly correct, which reported a healthy cluster as failed.
+  # Match on the canonical IP, exactly as the CSP does with
+  # GetCanonicalIPAddress(). See the ARRAY IDENTITY note in common/vars.
+  ansible.builtin.assert:
+    that:
+      - fb_final_stale_mappings | length == 0
+    fail_msg: >-
+      VERIFICATION FAILED: {{ fb_final_stale_mappings | length }}
+      HPEReplicationMapping object(s) name an array other than
+      {{ fb_original_primary_ip }} ({{ failback_original_primary.name }})
+      as primary: {{ fb_final_stale_mappings | join(', ') }}.
+      The array and Kubernetes DISAGREE about the topology. The next publish
+      (pod reschedule, drain, scale-up) will target the wrong array.
+      Inspect with: kubectl get hperpm -o yaml
+    success_msg: >-
+      VERIFY 4 PASSED: all HPEReplicationMapping objects name
+      {{ fb_original_primary_ip }} ({{ failback_original_primary.name }})
+      as primary.
+    quiet: true
+
+# --- Emit the audit record --------------------------------------------------
+
+- name: "Report | ensure report directory exists"
+  ansible.builtin.file:
+    path: "{{ failback_report_dir }}"
+    state: directory
+    mode: "0750"
+  delegate_to: localhost
+
+- name: "Report | write structured audit record"
+  ansible.builtin.copy:
+    dest: >-
+      {{ failback_report_dir }}/failback-{{ failback_rcg_name }}-{{ ansible_date_time.epoch }}.json
+    mode: "0640"
+    content: "{{ _fb_audit | to_nice_json }}"
+  vars:
+    _fb_audit:
+      rcg: "{{ failback_rcg_name }}"
+      mode: "{{ failback_mode }}"
+      original_primary: "{{ failback_original_primary.name }}"
+      current_primary_before: "{{ failback_current_primary.name }}"
+      recovery_detected_at: "{{ fb_recovery_detected_at | default('n/a') }}"
+      switchover_started_at: "{{ fb_switchover_started_at | default('n/a') }}"
+      switchover_completed_at: "{{ fb_switchover_completed_at | default('n/a') }}"
+      completed_at: "{{ ansible_date_time.iso8601 }}"
+      rto_seconds: "{{ fb_rto_seconds }}"
+      volumes_discovered: >-
+        {{ [(fb_rehydrate_items | default([]) | length),
+            (fb_target_volumes | default([]) | length)] | max }}
+      vluns_created: "{{ fb_vluns_to_create | default([]) | length }}"
+      replication_mappings_total: "{{ fb_mappings_total | default(0) }}"
+      replication_mappings_swapped: "{{ fb_mappings_swapped_post | default(0) }}"
+      # Non-zero means the CSP never performed the failover-time swap and we
+      # had to repair the mapping BEFORE the switchover. Recorded because it is
+      # direct evidence of the CSP bug, not just an implementation detail.
+      replication_mappings_repaired_pre_switchover: "{{ fb_mappings_swapped_pre | default(0) }}"
+      stale_replication_mappings: "{{ fb_final_stale_mappings }}"
+      workloads_restarted: "{{ fb_workloads_to_restart | default([]) | length }}"
+      final_role: "{{ fb_final_role_label }}"
+      final_active_vluns: "{{ fb_final_active_vluns }}"
+      final_attached_volumes: "{{ fb_final_attached }}"
+      unsynced_volumes: "{{ fb_final_unsynced }}"
+      result: "SUCCESS"
+  delegate_to: localhost
+
+- name: "Report | emit a Kubernetes Event for the audit trail"
+  # Putting the outcome in the cluster's own event stream means an operator who
+  # was not watching the playbook can still see what happened and when.
+  kubernetes.core.k8s:
+    state: present
+    kubeconfig: "{{ failback_kubeconfig | default(omit, true) }}"
+    context: "{{ failback_kube_context | default(omit, true) }}"
+    definition:
+      apiVersion: v1
+      kind: Event
+      metadata:
+        generateName: hpe-csi-failback-
+        namespace: "{{ failback_event_namespace }}"
+      type: Normal
+      reason: FailbackCompleted
+      message: >-
+        Automated failback of RCG {{ failback_rcg_name }} to
+        {{ failback_original_primary.name }} completed in
+        {{ fb_rto_seconds }}s. {{ fb_final_attached }} volumes attached,
+        {{ fb_workloads_to_restart | default([]) | length }} workloads restarted.
+      involvedObject:
+        apiVersion: v1
+        kind: Namespace
+        name: "{{ failback_event_namespace }}"
+      firstTimestamp: "{{ ansible_date_time.iso8601 }}"
+      lastTimestamp: "{{ ansible_date_time.iso8601 }}"
+      count: 1
+  failed_when: false
+  when: failback_emit_k8s_events | bool
+
+- name: "Report | final summary"
+  ansible.builtin.debug:
+    msg:
+      - "=============================================================="
+      - "           ZERO-TOUCH FAILBACK COMPLETED SUCCESSFULLY"
+      - "=============================================================="
+      - "RCG                    : {{ failback_rcg_name }}"
+      - "Primary is now         : {{ failback_original_primary.name }}"
+      - "Volumes discovered     : {{ fb_rehydrate_items | default([]) | length }}"
+      - "VLUNs created          : {{ fb_vluns_to_create | default([]) | length }}"
+      - "Repl. mappings swapped : {{ fb_mappings_swapped_post | default(0) }} of {{ fb_mappings_total | default(0) }}"
+      - "  repaired pre-switchover (CSP did not swap on failover): {{ fb_mappings_swapped_pre | default(0) }}"
+      - "Workloads restarted    : {{ fb_workloads_to_restart | default([]) | length }}"
+      - "Volumes attached       : {{ fb_final_attached }}"
+      - "Replication            : {{ 'HEALTHY' if fb_final_unsynced | length == 0
+                                     else 'DEGRADED' }}"
+      - "K8s/array topology     : {{ 'IN SYNC' if fb_final_stale_mappings | length == 0
+                                     else 'DISAGREEMENT' }}"
+      - "Elapsed (RTO)          : {{ fb_rto_seconds }}s"
+      - "--------------------------------------------------------------"
+      - "Manual steps required  : 0  (was 3)"
+      - "=============================================================="

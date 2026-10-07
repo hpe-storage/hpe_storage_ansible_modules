@@ -1,0 +1,18 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# Roles other than `common` do not define their own defaults; they consume the
+# shared ones so that a single group_vars file configures the whole collection.
+# These meta files exist only to satisfy role discovery.
+galaxy_info:
+  author: HPE CSI Team
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+dependencies: []
+
+# This role is invoked TWICE per failback — once with fb_mapping_phase=pre
+# (before the switchover) and once with fb_mapping_phase=post (after it).
+# Ansible deduplicates a role listed more than once in the same play unless
+# allow_duplicates is set, which would silently drop the post-switchover swap
+# and leave the driver publishing against the old primary.
+allow_duplicates: true

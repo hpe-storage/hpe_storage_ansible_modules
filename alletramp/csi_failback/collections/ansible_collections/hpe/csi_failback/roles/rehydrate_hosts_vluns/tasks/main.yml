@@ -1,0 +1,544 @@
+---
+# (c) Copyright 2026 Hewlett Packard Enterprise Development LP
+#
+# ROLE 2 of 6 — rehydrate_hosts_vluns
+#
+# While the original primary was down, the CSI driver republished every volume
+# on the surviving array. No Host objects and no VLUNs were created on the down
+# array, because it could not be reached. When it returns it therefore has the
+# replicated volumes but NO host mappings — so a switchover alone would leave
+# every workload without a path.
+#
+# This role closes that gap:
+#   1. Discover the affected volumes and the nodes they are attached to, from
+#      LIVE Kubernetes VolumeAttachment/PV objects. Nothing is hardcoded.
+#   2. Ensure a Host object exists on the original primary for every node.
+#   3. Ensure a Host-Sees VLUN exists on the original primary for every
+#      (volume, host) pair.
+#
+# EVERY STEP IS GET-BEFORE-ACT. Re-running this role against an already-
+# rehydrated array must produce zero changes. That property is what makes the
+# whole playbook safe to retry after a partial failure.
+
+# ---------------------------------------------------------------------------
+# Step 1 — discover volumes from Kubernetes (the source of truth for "what is
+# actually attached", which the array cannot tell us on its own)
+# ---------------------------------------------------------------------------
+
+- name: "Rehydrate | fetch VolumeAttachments for the HPE CSI driver"
+  kubernetes.core.k8s_info:
+    api_version: storage.k8s.io/v1
+    kind: VolumeAttachment
+    kubeconfig: "{{ failback_kubeconfig | default(omit, true) }}"
+    context: "{{ failback_kube_context | default(omit, true) }}"
+  register: _fb_vattach
+
+- name: "Rehydrate | build attached-volume map (PV name -> node)"
+  # Only attachments belonging to our CSI driver and currently marked attached.
+  # A stale VolumeAttachment left behind by a crashed node would otherwise make
+  # us recreate a VLUN for a host that no longer needs it (CON-4406 territory).
+  ansible.builtin.set_fact:
+    fb_attachments: >-
+      {{ _fb_vattach.resources
+         | selectattr('spec.attacher', 'equalto', failback_csi_driver_name)
+         | selectattr('status.attached', 'defined')
+         | selectattr('status.attached', 'equalto', true)
+         | map(attribute='spec')
+         | list }}
+
+- name: "Rehydrate | correlate PVs with array volume names and the RCG"
+  # Shared with republish_workloads so both roles derive fb_target_volumes the
+  # same way and neither depends on the other having run first.
+  ansible.builtin.include_role:
+    name: hpe.csi_failback.common
+    tasks_from: discover_rcg_volumes.yml
+
+- name: "Rehydrate | flatten into (volume, node) work items"
+  # vlun_key is NOT built here: it needs the ARRAY host name, which we can only
+  # resolve after reading the array's host list. It is added later, once
+  # fb_node_to_array_host exists.
+  ansible.builtin.set_fact:
+    fb_rehydrate_items: >-
+      {{ fb_rehydrate_items | default([]) + [{
+           'pv_name': item.0.metadata.name,
+           'array_volume':
+             item.0.spec.csi.volumeAttributes.volumeName
+             | default(item.0.spec.csi.volumeHandle | regex_replace('^.*:', '')),
+           'node': item.1.nodeName
+         }] }}
+  loop: >-
+    {{ fb_target_volumes
+       | product(fb_attachments) | list }}
+  loop_control:
+    label: "{{ item.0.metadata.name }} -> {{ item.1.nodeName }}"
+  when: item.1.source.persistentVolumeName | default('') == item.0.metadata.name
+
+- name: "Rehydrate | fail fast if nothing was discovered"
+  ansible.builtin.assert:
+    that:
+      - fb_rehydrate_items | default([]) | length > 0
+    fail_msg: >-
+      No attached volumes found for RCG '{{ failback_rcg_name }}' with driver
+      '{{ failback_csi_driver_name }}'. Either the RCG name is wrong, the
+      StorageClass does not set the remoteCopyGroup volume attribute, or no
+      workloads are running. Refusing to switch over a group we cannot verify.
+    quiet: true
+
+- name: "Rehydrate | report discovered work"
+  ansible.builtin.debug:
+    msg: >-
+      Discovered {{ fb_rehydrate_items | length }} (volume,node) pairs across
+      {{ fb_rehydrate_items | map(attribute='node') | unique | list | length }}
+      nodes for RCG '{{ failback_rcg_name }}'.
+
+# ---------------------------------------------------------------------------
+# Step 2 — ensure Host objects exist on the original primary
+# ---------------------------------------------------------------------------
+
+- name: "Rehydrate | login to original primary"
+  ansible.builtin.include_role:
+    name: hpe.csi_failback.common
+    tasks_from: wsapi_login.yml
+  vars:
+    _fb_array: "{{ failback_original_primary }}"
+    _fb_role: original_primary
+
+- name: "Rehydrate | read existing hosts on original primary"
+  ansible.builtin.uri:
+    url: "{{ failback_original_primary.wsapi_url }}{{ wsapi_hosts_path }}"
+    method: GET
+    headers:
+      X-HP3PAR-WSAPI-SessionKey: "{{ fb_session_original_primary }}"
+    status_code: [200]
+    validate_certs: "{{ failback_original_primary.validate_certs }}"
+    use_proxy: "{{ failback_wsapi_use_proxy | default(false) | bool }}"
+    timeout: 60
+  register: _fb_existing_hosts
+  no_log: true
+
+- name: "Rehydrate | index existing host names"
+  ansible.builtin.set_fact:
+    fb_existing_host_names: >-
+      {{ _fb_existing_hosts.json.members
+         | default([]) | map(attribute='name') | list }}
+  no_log: true
+
+# ---------------------------------------------------------------------------
+# Map Kubernetes node name -> ARRAY host name
+# ---------------------------------------------------------------------------
+# These are NOT the same string, and assuming they were is why VLUN creation
+# silently did nothing.
+#
+# Active Peer Persistence requires hosts to be created manually with a PROTOCOL
+# PREFIX, and the CSP works with exactly that prefixed form throughout
+# (api/mock_data.go: HostName = "iqn-host123"; CreateVLUNRequest.HostName =
+# "iqn-host123"):
+#
+#   createhost -iscsi iqn-my-compute-node-1 iqn.1994-05.com.redhat:my-node-1
+#                     ^^^^ array host name        ^^^^ initiator IQN
+#
+# So a node called "worker-1" appears on the array as "iqn-worker-1"
+# (or "nqntcp-"/"wwn-" for NVMe-TCP/FC).
+#
+# Passing the bare node name meant:
+#   - every node looked "missing" (no array host is named plainly), so
+#   - every work item was rejected by the fb_missing_hosts filter, so
+#   - fb_vluns_to_create came out EMPTY and the role reported success having
+#     created nothing — matching the report's "vluns_created": "0".
+#
+# We resolve by matching the array's own host list rather than assembling a
+# name ourselves: exact match first, then "<prefix>-<node>". Building the
+# string blindly would invent a host that does not exist and push the failure
+# to the array instead.
+
+- name: "Rehydrate | resolve each node to its array host name"
+  ansible.builtin.set_fact:
+    fb_node_to_array_host: >-
+      {{ fb_node_to_array_host | default({}) | combine({
+           item: (
+             [item] | select('in', fb_existing_host_names) | list
+             + fb_existing_host_names
+               | select('match',
+                        '^(iqn|nqntcp|wwn)-' ~ (item | regex_escape) ~ '$')
+               | list
+           ) | first | default('') }) }}
+  loop: "{{ fb_rehydrate_items | map(attribute='node') | unique | list }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: "Rehydrate | report the node -> array host mapping"
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.key }} -> {{ item.value if item.value | length > 0
+                           else 'NO MATCHING ARRAY HOST' }}
+  loop: "{{ fb_node_to_array_host | default({}) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: "Rehydrate | identify nodes with no Host object on original primary"
+  # APP requires hosts to be created manually with a protocol prefix
+  # (iqn-/nqntcp-/wwn-) and admitted to the RCG with proximity 'all'. The CSI
+  # driver does NOT create them. If a host is missing here we report it loudly
+  # rather than inventing one, because inventing a host with the wrong
+  # initiator name silently produces a volume nobody can see.
+  ansible.builtin.set_fact:
+    fb_missing_hosts: >-
+      {{ fb_node_to_array_host | default({}) | dict2items
+         | selectattr('value', 'equalto', '')
+         | map(attribute='key') | list }}
+
+- name: "Rehydrate | warn about missing host objects"
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ fb_missing_hosts | length }} node(s) have no Host object on
+      the original primary: {{ fb_missing_hosts | join(', ') }}.
+      APP requires hosts to be pre-created with the correct protocol prefix and
+      admitted to the RCG. VLUN creation for these nodes will be SKIPPED.
+      Create them (createhost -iscsi iqn-<node> <initiator-iqn>;
+      admitrcopyhost -proximity all {{ failback_rcg_name }} iqn-<node>)
+      and re-run. This playbook is idempotent.
+  when: fb_missing_hosts | length > 0
+
+# ---------------------------------------------------------------------------
+# Step 3 — ensure a Host-Sees VLUN exists for every (volume, host) pair
+# ---------------------------------------------------------------------------
+
+- name: "Rehydrate | read volumes present on original primary"
+  # The array stores volume names TRUNCATED (31 chars for a CSI-provisioned
+  # volume), so the Kubernetes PV name
+  #   pvc-236a1263-4b12-4c19-942e-e1fde5320ea6
+  # exists on the array as
+  #   pvc-236a1263-4b12-4c19-942e-e1f
+  # POSTing a VLUN with the untruncated name returns 404 "volume does not
+  # exist". Rather than hardcode a truncation length (which differs per name
+  # and per CSP version) we read the array's own inventory and match against
+  # it — the array is the only authority on what its volumes are called.
+  ansible.builtin.uri:
+    url: "{{ failback_original_primary.wsapi_url }}{{ wsapi_volumes_path }}"
+    method: GET
+    headers:
+      X-HP3PAR-WSAPI-SessionKey: "{{ fb_session_original_primary }}"
+    status_code: [200]
+    validate_certs: "{{ failback_original_primary.validate_certs }}"
+    use_proxy: "{{ failback_wsapi_use_proxy | default(false) | bool }}"
+    timeout: 60
+  register: _fb_array_volumes
+  # Array-wide inventory; can be thousands of entries. Never echo it.
+  no_log: true
+
+- name: "Rehydrate | index array volume names"
+  ansible.builtin.set_fact:
+    fb_array_volume_names: >-
+      {{ _fb_array_volumes.json.members
+         | default([]) | map(attribute='name') | list }}
+  no_log: true
+
+- name: "Rehydrate | report array volume inventory size"
+  ansible.builtin.debug:
+    msg: >-
+      Read {{ fb_array_volume_names | length }} volume names from the original
+      primary to resolve truncated PV names (list not printed).
+
+- name: "Rehydrate | map each PV name to the real (possibly truncated) volume"
+  # Exact match wins. Otherwise take the LONGEST array name contained in the PV
+  # name.
+  #
+  # Longest wins because, with UUID-based PVC names, a shorter match can only
+  # be a less specific slice of the same volume — never a different one. Taking
+  # the longest also stops two PVs collapsing onto one array volume when their
+  # names share a short leading run.
+  #
+  # Jinja's sort() takes no key function, so to sort by LENGTH we zip each
+  # candidate with its length, sort the resulting [length, name] pairs
+  # ascending, and take the last pair's name. The leading [0, ''] sentinel
+  # makes "no candidate" resolve to '' instead of erroring on an empty list.
+  ansible.builtin.set_fact:
+    fb_volume_name_map: >-
+      {{ fb_volume_name_map | default({}) | combine({
+           item: (
+             item if item in fb_array_volume_names else (
+               [[0, '']] + (
+                 (fb_array_volume_names | select('in', item) | list)
+                 | map('length') | list
+                 | zip(fb_array_volume_names | select('in', item) | list)
+                 | map('list') | list
+               )
+             ) | sort | last | last
+           ) }) }}
+  loop: >-
+    {{ fb_rehydrate_items | map(attribute='array_volume') | unique | list }}
+  loop_control:
+    label: "{{ item }}"
+
+- name: "Rehydrate | assert resolved names are true prefixes, not coincidences"
+  # 'in' is a SUBSTRING test; truncation only ever produces a PREFIX. Checking
+  # the distinction here means a name that matched by accident is caught as an
+  # error instead of quietly mapping a workload onto somebody else's volume.
+  ansible.builtin.assert:
+    that:
+      - item.key.startswith(item.value)
+    fail_msg: >-
+      Volume '{{ item.value }}' matches PV '{{ item.key }}' only as a
+      substring, not as a truncated prefix. Refusing to map a VLUN onto a
+      volume that may belong to another workload.
+    quiet: true
+  loop: "{{ fb_volume_name_map | default({}) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }} -> {{ item.value }}"
+  when: item.value | length > 0
+
+- name: "Rehydrate | report unresolvable volumes"
+  # A volume the array has never heard of must NOT be turned into a VLUN POST:
+  # that is the 404 we were chasing. Report it and drop it, so the rest of the
+  # rehydration still completes and the operator sees exactly what is missing.
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: no volume on the original primary matches PV
+      '{{ item.key }}'. It may not have replicated yet. VLUNs for it will be
+      SKIPPED; re-run once the RCG has synced.
+  loop: "{{ fb_volume_name_map | default({}) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: item.value | length == 0
+
+- name: "Rehydrate | rebuild work items with array host + VLUN key"
+  # The VLUN key and the POST body must both use the ARRAY host name
+  # ("iqn-worker-1"), not the Kubernetes node name ("worker-1"), AND the ARRAY
+  # volume name (truncated), not the PV name. Resolving both once, here, keeps
+  # the existence check and the create call consistent by construction — they
+  # disagreed before, which is how the gap went unnoticed.
+  ansible.builtin.set_fact:
+    fb_rehydrate_resolved: >-
+      {{ (fb_rehydrate_resolved | default([])) + [
+           item | combine({
+             'pv_volume': item.array_volume,
+             'array_volume': fb_volume_name_map[item.array_volume]
+                             | default(''),
+             'array_host': fb_node_to_array_host[item.node] | default(''),
+             'vlun_key': (fb_volume_name_map[item.array_volume] | default(''))
+                         ~ '::'
+                         ~ (fb_node_to_array_host[item.node] | default(''))
+           })] }}
+  loop: "{{ fb_rehydrate_items }}"
+  loop_control:
+    label: "{{ item.array_volume }} -> {{ item.node }}"
+
+- name: "Rehydrate | adopt the resolved work items"
+  # Drop anything that failed to resolve to a real array volume, and collapse
+  # duplicates: two PVs whose names both resolve to one array volume would
+  # otherwise produce two identical POSTs for the same (volume,host) pair.
+  ansible.builtin.set_fact:
+    fb_rehydrate_items: >-
+      {{ fb_rehydrate_resolved | default([])
+         | rejectattr('array_volume', 'equalto', '')
+         | unique(attribute='vlun_key') | list }}
+
+- name: "Rehydrate | read existing VLUNs on original primary"
+  ansible.builtin.uri:
+    url: "{{ failback_original_primary.wsapi_url }}{{ wsapi_vluns_path }}"
+    method: GET
+    headers:
+      X-HP3PAR-WSAPI-SessionKey: "{{ fb_session_original_primary }}"
+    status_code: [200]
+    validate_certs: "{{ failback_original_primary.validate_certs }}"
+    use_proxy: "{{ failback_wsapi_use_proxy | default(false) | bool }}"
+    timeout: 60
+  register: _fb_existing_vluns
+  # Array-wide VLUN table. Never echo it.
+  no_log: true
+
+- name: "Rehydrate | index existing (volume,host) VLUN pairs"
+  # Key on BOTH volume and host. A VLUN is a (volume, host) mapping, so the
+  # same volume legitimately appears once per node that attaches it, and the
+  # same host appears once per volume. Only the pair is unique.
+  ansible.builtin.set_fact:
+    fb_existing_vlun_pairs: >-
+      {{ _fb_existing_vluns.json.members | default([])
+         | map(attribute='volumeName') | zip(
+           _fb_existing_vluns.json.members | default([])
+           | map(attribute='hostname') | list)
+         | map('join', '::') | list }}
+  no_log: true
+
+- name: "Rehydrate | compute VLUNs that must be created"
+  ansible.builtin.set_fact:
+    fb_vluns_to_create: >-
+      {{ fb_rehydrate_items
+         | rejectattr('node', 'in', fb_missing_hosts)
+         | rejectattr('array_volume', 'undefined')
+         | list }}
+
+- name: "Rehydrate | record attachments established while the primary was down"
+  # A (volume,node) pair that is attached in Kubernetes but has NO VLUN on the
+  # original primary can only have been published while that array was down:
+  # had the pod been running before the outage, the CSI driver would have
+  # mapped it on both sides. This set — captured BEFORE we create anything —
+  # is what republish_workloads uses to restart only the pods that actually
+  # hold a single-sided path, instead of every pod in the RCG.
+  #
+  # Nodes with no Host object are included on purpose: their pods are just as
+  # affected, and the operator must see them in the restart plan even though
+  # we cannot create their VLUNs here.
+  ansible.builtin.set_fact:
+    fb_outage_attachments: >-
+      {{ fb_rehydrate_items
+         | rejectattr('vlun_key', 'in', fb_existing_vlun_pairs)
+         | list }}
+
+- name: "Rehydrate | report attachments established during the outage"
+  ansible.builtin.debug:
+    msg: >-
+      {{ fb_outage_attachments | length }} of {{ fb_rehydrate_items | length }}
+      (volume,node) pairs have no VLUN on the original primary and were
+      therefore attached during the outage:
+      {{ fb_outage_attachments
+         | map(attribute='pv_volume') | zip(fb_outage_attachments | map(attribute='node'))
+         | map('join', ' @ ') | list }}
+
+- name: "Rehydrate | filter out VLUNs that already exist (idempotency)"
+  # MUST compare on the (volume, host) PAIR, not on the volume name alone.
+  #
+  # The previous filter rejected any work item whose array_volume appeared
+  # ANYWHERE in the existing VLUN list, regardless of which host that VLUN
+  # belonged to. Because the array holds VLUNs for every OTHER volume/host
+  # combination too, a volume that was already mapped to one node was treated
+  # as "already done" for every node — and a volume attached on a node with no
+  # VLUN at all was skipped as soon as any VLUN for it existed elsewhere.
+  #
+  # This is why a PVC provisioned while the primary was DOWN got no VLUN on
+  # failback: the array had replicated the volume, the CSI driver had mapped it
+  # only on the surviving array, and the name-only match wrongly concluded
+  # there was nothing to create. The role then reported success having done
+  # nothing, and the workload came back with no path to its data.
+  ansible.builtin.set_fact:
+    fb_vluns_to_create: >-
+      {{ fb_vluns_to_create
+         | rejectattr('vlun_key', 'in', fb_existing_vlun_pairs)
+         | list }}
+
+- name: "Rehydrate | report VLUN plan"
+  ansible.builtin.debug:
+    msg:
+      - "(volume,node) pairs needed : {{ fb_rehydrate_items | length }}"
+      - "VLUNs already on the array : {{ fb_existing_vlun_pairs | length }}"
+      - "VLUNs to create            : {{ fb_vluns_to_create | length }}"
+      - "To create                  : {{ fb_vluns_to_create | map(attribute='vlun_key') | list }}"
+
+- name: "Rehydrate | verify every required VLUN is present or planned"
+  # Every (volume,node) pair we discovered must either already exist on the
+  # array or be in the creation plan. A pair in neither set means we silently
+  # dropped it — the failure mode that left a PVC with no path after failback.
+  ansible.builtin.assert:
+    that:
+      - fb_rehydrate_items
+        | rejectattr('node', 'in', fb_missing_hosts)
+        | rejectattr('vlun_key', 'in', fb_existing_vlun_pairs)
+        | rejectattr('vlun_key', 'in',
+                     fb_vluns_to_create | map(attribute='vlun_key') | list)
+        | list | length == 0
+    fail_msg: >-
+      Internal inconsistency: some (volume,node) pairs are neither present on
+      the array nor scheduled for creation. This would leave a workload with no
+      path to its data after the switchover.
+    quiet: true
+
+- name: "Rehydrate | DRY RUN — would create these VLUNs"
+  ansible.builtin.debug:
+    msg: >-
+      {{ '[check mode]' if ansible_check_mode else '[mode=off]' }}
+      POST {{ wsapi_vluns_path }}
+      volumeName={{ item.array_volume }} hostname={{ item.array_host }}
+      autoLun={{ failback_vlun_auto_lun }}
+  loop: "{{ fb_vluns_to_create }}"
+  loop_control:
+    label: "{{ item.array_volume }} -> {{ item.array_host }}"
+  when: not (failback_may_mutate_arrays | bool)
+
+- name: "Rehydrate | create Host-Sees VLUNs on original primary"
+  # autoLun lets the array pick the LUN. We deliberately do NOT pass a LUN we
+  # computed ourselves: a guessed LUN either collides or, worse, silently maps
+  # the wrong volume, which surfaces on the node as
+  # "device not found with serial ...".
+  ansible.builtin.uri:
+    url: "{{ failback_original_primary.wsapi_url }}{{ wsapi_vluns_path }}"
+    method: POST
+    headers:
+      X-HP3PAR-WSAPI-SessionKey: "{{ fb_session_original_primary }}"
+    body_format: json
+    # Rendered via to_json for the same reason as SWITCHOVER_GROUP: a quoted
+    # "{{ ... | int }}" scalar is still a STRING on the wire, and WSAPI answers
+    # {"code": 39, "desc": "invalid input: wrong type for value"}. lun and
+    # maxAutoLun must be integers and autoLun/noVcn booleans.
+    body: >-
+      {{
+        {
+          'volumeName': item.array_volume,
+          'hostname': item.array_host,
+          'lun': failback_vlun_lun_range_floor | int,
+          'autoLun': failback_vlun_auto_lun | bool,
+          'maxAutoLun': failback_vlun_lun_range_max | int,
+          'noVcn': false,
+          'overrideLowerPriority': false
+        } | to_json
+      }}
+    # 201 == created. 409 == already exists, which for an idempotent
+    # rehydrate is a SUCCESS, not an error.
+    status_code: [201, 409]
+    validate_certs: "{{ failback_original_primary.validate_certs }}"
+    use_proxy: "{{ failback_wsapi_use_proxy | default(false) | bool }}"
+    timeout: 60
+  loop: "{{ fb_vluns_to_create }}"
+  loop_control:
+    label: "{{ item.array_volume }} -> {{ item.array_host }}"
+  register: _fb_vlun_created
+  changed_when: _fb_vlun_created.status == 201
+  # The ONLY mutating array call in this role. Gated on both brakes: --check
+  # and failback_mode=off (preflight). See failback_may_mutate_arrays.
+  when: failback_may_mutate_arrays | bool
+
+# ---------------------------------------------------------------------------
+# Step 4 — read back the ACTUAL assigned LUNs
+# ---------------------------------------------------------------------------
+
+- name: "Rehydrate | re-read VLUNs to capture array-assigned LUNs"
+  ansible.builtin.uri:
+    url: "{{ failback_original_primary.wsapi_url }}{{ wsapi_vluns_path }}"
+    method: GET
+    headers:
+      X-HP3PAR-WSAPI-SessionKey: "{{ fb_session_original_primary }}"
+    status_code: [200]
+    validate_certs: "{{ failback_original_primary.validate_certs }}"
+    use_proxy: "{{ failback_wsapi_use_proxy | default(false) | bool }}"
+    timeout: 60
+  register: _fb_vluns_after
+  no_log: true
+  when: not ansible_check_mode
+
+- name: "Rehydrate | record assigned LUNs from ACTIVE rows only"
+  # CRITICAL WSAPI BEHAVIOUR. With autoLun the array writes the requested range
+  # FLOOR onto the VLUN *template* row (active == false) and the ACTUALLY
+  # ASSIGNED LUN onto the *active* rows (active == true). Reading the template
+  # row yields the floor (often 0) and produces a wrong LUN, which the driver
+  # then hands verbatim to the node plugin. Always read active rows.
+  #
+  # SCOPED TO THIS RCG. /api/v1/vluns returns every VLUN on the array. Keep
+  # only the rows for volumes we are failing back; otherwise the summary below
+  # prints every workload on the array and the count in the report is
+  # meaningless.
+  ansible.builtin.set_fact:
+    fb_assigned_luns: >-
+      {{ _fb_vluns_after.json.members | default([])
+         | selectattr('active', 'defined')
+         | selectattr('active', 'equalto', true)
+         | selectattr('volumeName', 'in',
+                      fb_rehydrate_items | map(attribute='array_volume') | list)
+         | list }}
+  when: not ansible_check_mode
+
+- name: "Rehydrate | summary of assigned LUNs (this RCG only)"
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.volumeName }} -> host {{ item.hostname }} LUN {{ item.lun }}
+  loop: "{{ fb_assigned_luns | default([]) }}"
+  loop_control:
+    label: "{{ item.volumeName }}"
