@@ -107,12 +107,13 @@
   failed_when: false
 
 - name: "Verify | count volumes that are not synchronized"
+  # remoteCopyGroup.volumes[] entries are keyed 'localVolumeName', not 'name'.
   ansible.builtin.set_fact:
     fb_unsynced_volumes: >-
       {{ _fb_sync_poll.json.volumes | default([])
          | selectattr('syncStatus', 'defined')
          | rejectattr('syncStatus', 'equalto', 3)
-         | map(attribute='name') | list }}
+         | map(attribute='localVolumeName') | list }}
 
 - name: "Verify | GATE 2 — every volume must be synchronized"
   ansible.builtin.assert:

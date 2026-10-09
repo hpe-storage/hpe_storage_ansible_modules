@@ -62,10 +62,11 @@
 - name: "Report | collect the array volume names that belong to this RCG"
   # The RCG object lists its member volumes by their ARRAY names (already
   # truncated), so this is the exact key to filter the array-wide VLUN table.
+  # WSAPI field is 'localVolumeName' (remoteCopyGroup.volumes[]), NOT 'name'.
   ansible.builtin.set_fact:
     fb_final_rcg_volume_names: >-
       {{ _fb_final_rcg.json.volumes | default([])
-         | map(attribute='name') | list }}
+         | map(attribute='localVolumeName') | select('defined') | list }}
 
 - name: "Report | read final VolumeAttachment state"
   kubernetes.core.k8s_info:
@@ -109,7 +110,7 @@
       {{ _fb_final_rcg.json.volumes | default([])
          | selectattr('syncStatus', 'defined')
          | rejectattr('syncStatus', 'equalto', 3)
-         | map(attribute='name') | list }}
+         | map(attribute='localVolumeName') | list }}
     fb_final_stale_mappings: >-
       {{ _fb_final_rpm.resources | default([])
          | selectattr('spec.rcg_details.rcgnames', 'defined')
