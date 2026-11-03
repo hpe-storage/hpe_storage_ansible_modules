@@ -1,0 +1,5 @@
+---
+- name: Run standalone Cinder replication failback
+  import_playbook: cinder-replication.yml
+  vars:
+    cinder_replication_action: failback

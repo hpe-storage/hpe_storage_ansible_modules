@@ -1,0 +1,5 @@
+---
+- name: Run standalone Cinder replication failover
+  import_playbook: cinder-replication.yml
+  vars:
+    cinder_replication_action: failover

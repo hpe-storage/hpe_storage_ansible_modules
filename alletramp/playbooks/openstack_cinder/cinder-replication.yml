@@ -1,0 +1,492 @@
+---
+- name: Run Cinder replication workflow
+  hosts: "{{ cinder_replication_execution_host | default('localhost') }}"
+  gather_facts: true
+  vars:
+    cinder_replication_cli: cinder
+    cinder_replication_openrc: "{{ ansible_env.HOME }}/openrc"
+    # devstack's openrc defaults to the demo user; service-list requires admin.
+    cinder_replication_openrc_args: ""
+    cinder_replication_verify_services: true
+    cinder_replication_conf_path: /etc/cinder/cinder.conf
+    # Capability gate: the deployed driver constants must define
+    # AUTO_FAILBACK_SUPPORTED = True. Pass -e auto_failback_supported=true to override.
+    # Empty = auto-detect from cinder-manage's shebang (falls back to python3).
+    cinder_replication_python: ""
+    cinder_replication_constants_module: cinder.volume.drivers.hpe.alletramp_constants
+    cinder_replication_auto_failback_override: "{{ auto_failback_supported | default(false) | bool }}"
+    cinder_replication_valid_backend_ids: []
+    cinder_replication_settle_retries: 24
+    cinder_replication_settle_delay: 5
+    cinder_replication_expected_status: >-
+      {{ 'failed-over' if cinder_replication_action == 'failover' else 'enabled' }}
+    # Cinder reports the same error/in-progress states for both directions.
+    cinder_replication_error_status: failover-error
+    cinder_replication_inprogress_status: failing-over
+    # After the settle window the OPPOSITE steady state is a failure: a failover that is
+    # still 'enabled', or a failback still 'failed-over', never actually transitioned.
+    cinder_replication_failure_states: >-
+      {{ ['error', cinder_replication_error_status,
+          'enabled' if cinder_replication_action == 'failover' else 'failed-over'] }}
+    cinder_replication_target_resolved: >-
+      {{ cinder_replication_target | default(cinder_failover_target | default('')) }}
+    cinder_replication_backend_id_resolved: >-
+      {{ cinder_replication_backend_id | default(cinder_failover_backend_id | default('')) }}
+    cinder_replication_backend_section: >-
+      {{ (cinder_replication_target_resolved | trim).split('@')[-1] }}
+    cinder_replication_backend_arg: >-
+      {% if cinder_replication_action == 'failback' %}
+      --backend_id default
+      {% elif cinder_replication_backend_id_resolved | length > 0 %}
+      --backend_id {{ cinder_replication_backend_id_resolved | quote }}
+      {% endif %}
+    cinder_replication_source_openrc: >-
+      if [ -f {{ cinder_replication_openrc | quote }} ]; then
+        . {{ cinder_replication_openrc | quote }} {{ cinder_replication_openrc_args }};
+      fi
+    # Lazily evaluated against the runtime service record selected below.
+    cinder_replication_noop: >-
+      {{ (cinder_replication_action == 'failover'
+          and cinder_replication_service.replication_status | default('') == 'failed-over')
+         or (cinder_replication_action == 'failback'
+          and cinder_replication_service.replication_status | default('') == 'enabled') }}
+
+  tasks:
+    # ----------------------------------------------------------------------
+    # PHASE 1 - Preflight Validation
+    # ----------------------------------------------------------------------
+    - name: Validate replication action (failover or failback)
+      ansible.builtin.assert:
+        that:
+          - cinder_replication_action in ['failover', 'failback']
+        fail_msg: >-
+          cinder_replication_action must be either 'failover' or 'failback'.
+        quiet: true
+
+    - name: Validate replication target identifier
+      ansible.builtin.assert:
+        that:
+          - cinder_replication_target_resolved | length > 0
+        fail_msg: >-
+          Define cinder_replication_target, or the compatibility variable
+          cinder_failover_target, as '<host>@<backend>'.
+        quiet: true
+
+    # ----------------------------------------------------------------------
+    # PHASE 1b - Driver Capability Gate (AUTO_FAILBACK_SUPPORTED)
+    # ----------------------------------------------------------------------
+    # Unless cinder_replication_python is set, use the interpreter cinder itself runs
+    # under: the shebang of cinder-manage (e.g. the devstack venv), else python3.
+    - name: Detect the Python interpreter used by cinder
+      ansible.builtin.shell: |
+        bin=$(command -v cinder-manage) || exit 0
+        read -r -a sb < <(head -n 1 "$bin" | sed -n 's/^#![[:space:]]*//p')
+        if [ "$(basename "${sb[0]:-}")" = env ]; then py=${sb[1]:-}; else py=${sb[0]:-}; fi
+        [ -n "$py" ] && command -v "$py"
+        exit 0
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: cinder_replication_detected_python
+      when:
+        - cinder_replication_python | length == 0
+        - not (cinder_replication_auto_failback_override | bool)
+
+    - name: Resolve the Python interpreter for the capability check
+      ansible.builtin.set_fact:
+        cinder_replication_python_resolved: >-
+          {{ cinder_replication_python
+             if cinder_replication_python | length > 0
+             else (cinder_replication_detected_python.stdout | default('') | trim or 'python3') }}
+
+    # Prints the constant's repr, or 'None' when the driver does not define it.
+    # A non-zero rc means the constants module could not be imported at all.
+    - name: Read AUTO_FAILBACK_SUPPORTED from the deployed driver constants
+      ansible.builtin.shell: >-
+        {{ cinder_replication_python_resolved | quote }} -c
+        'import importlib, sys; m = importlib.import_module(sys.argv[1]); print(repr(getattr(m, "AUTO_FAILBACK_SUPPORTED", None)))'
+        {{ cinder_replication_constants_module | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+      register: cinder_replication_capability
+      when: not (cinder_replication_auto_failback_override | bool)
+
+    - name: Fail when the driver constants cannot be inspected
+      ansible.builtin.assert:
+        that:
+          - cinder_replication_capability.rc == 0
+        fail_msg: >-
+          Unable to import '{{ cinder_replication_constants_module }}' with
+          '{{ cinder_replication_python_resolved }}', so AUTO_FAILBACK_SUPPORTED could not be checked.
+          Set cinder_replication_python / cinder_replication_constants_module for this host, or
+          pass -e auto_failback_supported=true if you have verified the driver is up to date.
+          {{ cinder_replication_capability.stderr | default('') | trim }}
+        quiet: true
+      when: not (cinder_replication_auto_failback_override | bool)
+
+    - name: Resolve whether automatic failover/failback is permitted
+      ansible.builtin.set_fact:
+        cinder_replication_capability_ok: >-
+          {{ (cinder_replication_auto_failback_override | bool)
+             or (cinder_replication_capability.stdout | default('') | trim == 'True') }}
+
+    - name: Warn that the AUTO_FAILBACK_SUPPORTED check was overridden
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: auto_failback_supported override is set; skipping the driver
+          AUTO_FAILBACK_SUPPORTED check. The operator is responsible for confirming the
+          deployed driver supports {{ cinder_replication_action }}.
+      when: cinder_replication_auto_failback_override | bool
+
+    - name: Report capability not enabled (no-op)
+      ansible.builtin.debug:
+        msg: >-
+          NO-OP: AUTO_FAILBACK_SUPPORTED is
+          {{ 'not defined' if cinder_replication_capability.stdout | trim == 'None'
+             else 'set to ' ~ (cinder_replication_capability.stdout | trim) }}
+          in '{{ cinder_replication_constants_module }}', so {{ cinder_replication_action }}
+          is skipped. the latest cinder patch is not applied yet. please apply the patch, restart the cinder services and retry.
+      when: not (cinder_replication_capability_ok | bool)
+
+    - name: End play when automatic failover/failback is not supported
+      ansible.builtin.meta: end_play
+      when: not (cinder_replication_capability_ok | bool)
+
+    # ----------------------------------------------------------------------
+    # PHASE 2 - Cinder Service Discovery
+    # ----------------------------------------------------------------------
+    # Single structured snapshot of cinder-volume services; every precheck below reads from it.
+    - name: Check OpenStack credentials file (openrc) is present
+      ansible.builtin.stat:
+        path: "{{ cinder_replication_openrc }}"
+      register: cinder_replication_openrc_stat
+
+    - name: Query cinder-volume service inventory from Cinder API
+      ansible.builtin.shell: |
+        set -o pipefail
+        {{ cinder_replication_source_openrc }}
+        out=""
+        diag=""
+        # A usable result is exit 0 plus a prettytable header; row filtering happens later.
+        attempt() {
+          res="$("$@" 2>&1)" && rc=0 || rc=$?
+          if [ "$rc" -eq 0 ] && printf '%s' "$res" | grep -q 'Binary'; then
+            out="$res"
+            return 0
+          fi
+          diag="$diag [$* -> rc=$rc: $(printf '%s' "$res" | tr '\n' ' ' | cut -c1-200)]"
+          return 1
+        }
+        attempt {{ cinder_replication_cli }} service-list --withreplication True \
+          || attempt {{ cinder_replication_cli }} service-list --withreplication \
+          || attempt {{ cinder_replication_cli }} service-list \
+          || attempt openstack volume service list --long
+        if [ -z "$out" ]; then
+          printf 'openrc=%s user=%s\n' "{{ cinder_replication_openrc }}" "$(id -un)" >&2
+          printf 'attempts:%s\n' "$diag" >&2
+          exit 3
+        fi
+        printf '%s\n' "$out" | awk -F'|' '
+        function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+        $0 ~ /Binary/ && $0 ~ /Host/ && seen == 0 {
+          for (i = 2; i < NF; i++) {
+            k = tolower(trim($i)); gsub(/ /, "_", k); idx[k] = i
+          }
+          seen = 1; next
+        }
+        seen == 1 && NF > 3 {
+          if (trim($2) != "cinder-volume") next
+          printf "{"
+          first = 1
+          for (k in idx) {
+            v = trim($(idx[k])); gsub(/"/, "", v)
+            if (first == 0) printf ","
+            printf "\"%s\":\"%s\"", k, v
+            first = 0
+          }
+          printf "}\n"
+        }'
+      args:
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+      register: cinder_replication_svc_raw
+
+    - name: Confirm Cinder API is reachable and authorized
+      ansible.builtin.assert:
+        that:
+          - cinder_replication_svc_raw.rc != 3
+        fail_msg: |-
+          Unable to query Cinder services. Every client invocation failed or returned
+          no service table.
+
+          openrc     : {{ cinder_replication_openrc }} {{ cinder_replication_openrc_args }}
+          openrc file: {{ 'present' if cinder_replication_openrc_stat.stat.exists else 'MISSING' }}
+
+          'service-list' is admin-only. If this is devstack, source openrc as admin:
+            -e cinder_replication_openrc_args='admin admin'
+
+          {{ cinder_replication_svc_raw.stderr | default('(no stderr captured)') }}
+        quiet: true
+
+    - name: Parse cinder-volume service inventory
+      ansible.builtin.set_fact:
+        cinder_replication_services: >-
+          {{ cinder_replication_svc_raw.stdout_lines | default([])
+             | select('match', '^\{.*\}$') | map('from_json') | list }}
+
+    - name: Select the target cinder-volume backend record
+      ansible.builtin.set_fact:
+        cinder_replication_service: >-
+          {{ (cinder_replication_services
+              | selectattr('host', 'equalto', cinder_replication_target_resolved | trim)
+              | list | first) | default({}, true) }}
+
+    - name: Verify target backend is online and ready for {{ cinder_replication_action }}
+      ansible.builtin.assert:
+        that:
+          - cinder_replication_service | length > 0
+          - cinder_replication_service.state | default('') == 'up'
+          - cinder_replication_service.replication_status | default('') != 'failing-over'
+        fail_msg: >-
+          '{{ cinder_replication_target_resolved | trim }}' is not ready for
+          {{ cinder_replication_action }}:
+          {% if cinder_replication_service | length == 0 %}
+          host is not a registered cinder-volume service (known hosts:
+          {{ cinder_replication_services | map(attribute='host') | list | join(', ') }}).
+          {% elif cinder_replication_service.state | default('') != 'up' %}
+          service state is '{{ cinder_replication_service.state | default("unknown") }}'
+          (must be 'up').
+          {% else %}
+          backend is mid-transition
+          ('{{ cinder_replication_service.replication_status | default("unknown") }}');
+          wait for it to settle.
+          {% endif %}
+        quiet: true
+
+    - name: Verify target replication status permits failover
+      ansible.builtin.assert:
+        that:
+          - >-
+            cinder_replication_action != 'failover'
+            or cinder_replication_service.replication_status | default('') in ['enabled', 'failed-over']
+        fail_msg: >-
+          Cinder failover requires replication_status 'enabled' or 'failed-over' for
+          '{{ cinder_replication_target_resolved | trim }}'; the service record reports
+          '{{ cinder_replication_service.replication_status | default("unknown") }}'.
+          Check `cinder service-list --withreplication` before retrying.
+        quiet: true
+
+    # ----------------------------------------------------------------------
+    # PHASE 3 - Backend Policy Validation
+    # ----------------------------------------------------------------------
+    - name: Discover configured replication targets from cinder.conf
+      ansible.builtin.shell: |
+        test -f {{ cinder_replication_conf_path | quote }} || exit 0
+        awk -v sec="[{{ cinder_replication_backend_section }}]" '
+        /^[ \t]*\[/ { inblock = (index($0, sec) > 0) }
+        inblock && /^[ \t]*replication_device[ \t]*=/ {
+          n = split($0, parts, ",")
+          for (i = 1; i <= n; i++) {
+            if (parts[i] ~ /backend_id[ \t]*:/) {
+              split(parts[i], kv, ":")
+              gsub(/^[ \t]+|[ \t]+$/, "", kv[2])
+              if (kv[2] != "") print kv[2]
+            }
+          }
+        }' {{ cinder_replication_conf_path | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+      register: cinder_replication_conf_ids
+
+    # Empty list means cinder.conf was unreadable; membership check degrades to advisory.
+    - name: Resolve permitted replication backend_ids
+      ansible.builtin.set_fact:
+        cinder_replication_allowed_ids: >-
+          {{ (cinder_replication_conf_ids.stdout_lines | default([]))
+             | union(cinder_replication_valid_backend_ids) | select() | list }}
+
+    - name: Validate requested backend_id against replication policy
+      ansible.builtin.assert:
+        that:
+          - cinder_replication_action != 'failback' or cinder_replication_backend_id_resolved | trim in ['', 'default']
+          - cinder_replication_action != 'failover' or cinder_replication_backend_id_resolved | trim != 'default'
+          - >-
+            cinder_replication_action != 'failover'
+            or cinder_replication_allowed_ids | length == 0
+            or cinder_replication_backend_id_resolved | trim | length == 0
+            or cinder_replication_backend_id_resolved | trim in cinder_replication_allowed_ids
+          - >-
+            cinder_replication_action != 'failover'
+            or cinder_replication_service.replication_status | default('') != 'failed-over'
+            or cinder_replication_backend_id_resolved | trim | length == 0
+            or cinder_replication_backend_id_resolved | trim == cinder_replication_service.active_backend_id | default('')
+        fail_msg: >-
+          {% if cinder_replication_action == 'failback' %}
+          Failback always targets 'default'. Unset cinder_replication_backend_id or set it
+          to 'default' (got '{{ cinder_replication_backend_id_resolved | trim }}').
+          {% elif cinder_replication_service.replication_status | default('') == 'failed-over'
+                  and cinder_replication_backend_id_resolved | trim not in ['', cinder_replication_service.active_backend_id | default('')] %}
+          Backend is already failed over to
+          '{{ cinder_replication_service.active_backend_id | default("unknown") }}'. Fail back
+          to 'default' before failing over to '{{ cinder_replication_backend_id_resolved | trim }}'.
+          {% else %}
+          backend_id '{{ cinder_replication_backend_id_resolved | trim }}' is not a configured
+          replication target for '{{ cinder_replication_backend_section }}'. Configured:
+          {{ cinder_replication_allowed_ids | join(', ') | default('none discovered', true) }}
+          {% endif %}
+        quiet: true
+
+    # ----------------------------------------------------------------------
+    # PHASE 4 - Idempotency Gate
+    # ----------------------------------------------------------------------
+    - name: Report backend already in desired state (no-op)
+      ansible.builtin.debug:
+        msg: >-
+          NO-OP: '{{ cinder_replication_target_resolved | trim }}' is already in
+          replication_status '{{ cinder_replication_service.replication_status | default("unknown") }}'
+          (active_backend_id '{{ cinder_replication_service.active_backend_id | default("default") }}').
+          Nothing to do for {{ cinder_replication_action }}.
+      when: cinder_replication_noop | bool
+
+    - name: End play when no replication change is required
+      ansible.builtin.meta: end_play
+      when: cinder_replication_noop | bool
+
+    # ----------------------------------------------------------------------
+    # PHASE 5 - Replication Execution
+    # ----------------------------------------------------------------------
+    - name: Capture pre-change cinder-volume service state
+      ansible.builtin.shell: |
+        set -o pipefail
+        {{ cinder_replication_source_openrc }}
+        {{ cinder_replication_cli }} service-list
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: cinder_replication_services_before
+      when: cinder_replication_verify_services | bool
+
+    - name: Execute Cinder {{ cinder_replication_action }} on target backend
+      ansible.builtin.shell: |
+        set -o pipefail
+        {{ cinder_replication_source_openrc }}
+        {{ cinder_replication_cli }} failover-host {{ cinder_replication_target_resolved | quote }} {{ cinder_replication_backend_arg }}
+      args:
+        executable: /bin/bash
+      changed_when: true
+      register: cinder_replication_result
+
+    # failover-host returns before the backend has transitioned, so poll the service record
+    # for the settle window (retries * delay). The opposite steady state is NOT a break
+    # condition, so the backend gets the full window to start transitioning before we judge it.
+    - name: Wait for replication_status to reach steady state
+      ansible.builtin.shell: |
+        set -o pipefail
+        {{ cinder_replication_source_openrc }}
+        {{ cinder_replication_cli }} service-list --withreplication 2>/dev/null \
+          | awk -F'|' -v target={{ cinder_replication_target_resolved | trim | quote }} '
+        function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+        $0 ~ /Binary/ && $0 ~ /Host/ && seen == 0 {
+          for (i = 2; i < NF; i++) {
+            k = tolower(trim($i)); gsub(/ /, "_", k); idx[k] = i
+          }
+          seen = 1; next
+        }
+        seen == 1 && NF > 3 {
+          if (trim($2) != "cinder-volume") next
+          if (!("host" in idx) || !("replication_status" in idx)) next
+          if (trim($(idx["host"])) != target) next
+          status = trim($(idx["replication_status"]))
+          found = 1
+        }
+        END {
+          if (found != 1 || status == "") status = "unknown"
+          print status
+        }'
+      args:
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+      register: cinder_replication_settle
+      retries: "{{ cinder_replication_settle_retries | int }}"
+      delay: "{{ cinder_replication_settle_delay | int }}"
+      until: >-
+        cinder_replication_settle.stdout | trim
+        in [cinder_replication_expected_status | trim, 'unknown',
+            'error', cinder_replication_error_status | trim]
+
+    # Three outcomes: completed (expected), failed (error or wrong steady state after the
+    # window), or still in progress (failing-over). 'unknown' falls through silently.
+    - name: Fail when {{ cinder_replication_action }} ended in an error state
+      ansible.builtin.assert:
+        that:
+          - >-
+            cinder_replication_settle.stdout | trim
+            not in cinder_replication_failure_states
+        fail_msg: >-
+          '{{ cinder_replication_target_resolved | trim }}' reported replication_status
+          '{{ cinder_replication_settle.stdout | trim }}' for
+          {{ cinder_replication_action }}. The transition has FAILED. Inspect the
+          cinder-volume logs and the host/volume replication state with:
+          'cinder service-list --withreplication' and
+          'cinder list --all-projects --field ID,Name,Status,os-vol-host-attr:host,replication_status'.
+        quiet: true
+
+    - name: Confirm {{ cinder_replication_action }} transition completed
+      ansible.builtin.debug:
+        msg: >-
+          '{{ cinder_replication_target_resolved | trim }}' reached replication_status
+          '{{ cinder_replication_expected_status | trim }}'. {{ cinder_replication_action }}
+          completed successfully.
+      when: >-
+        cinder_replication_settle.stdout | trim == cinder_replication_expected_status | trim
+
+    # Still mid-transition after the settle window: NOT a failure, surface a clear warning.
+    - name: Warn that {{ cinder_replication_action }} is still in progress
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: '{{ cinder_replication_target_resolved | trim }}' did not reach
+          replication_status '{{ cinder_replication_expected_status | trim }}' within
+          {{ cinder_replication_settle_retries | int * cinder_replication_settle_delay | int }}s
+          (last seen '{{ cinder_replication_settle.stdout | trim }}'). The transition is
+          still in progress - this is NOT a failure. Keep monitoring until it completes:
+          (1) the cinder-volume service/host -
+          'cinder service-list --withreplication'
+          (watch the replication_status column become '{{ cinder_replication_expected_status | trim }}');
+          (2) the affected volumes -
+          'cinder list --all-projects --field ID,Name,Status,os-vol-host-attr:host,replication_status'
+          (watch each volume's replication_status reach '{{ cinder_replication_expected_status | trim }}').
+          If it instead settles on '{{ cinder_replication_error_status | trim }}', the
+          transition has FAILED - check the cinder-volume logs.
+      when: >-
+        cinder_replication_settle.stdout | trim == cinder_replication_inprogress_status | trim
+
+    # ----------------------------------------------------------------------
+    # PHASE 6 - Post-Change Verification
+    # ----------------------------------------------------------------------
+    # Capture the service table already reduced to the frame + the target host's row,
+    # so downstream reporting needs no fragile Jinja regex.
+    - name: Capture post-change cinder-volume service state
+      ansible.builtin.shell: |
+        set -o pipefail
+        {{ cinder_replication_source_openrc }}
+        {{ cinder_replication_cli }} service-list --withreplication \
+          | awk -v target={{ cinder_replication_target_resolved | trim | quote }} '
+              /^[+]/ { print; next }
+              $0 ~ /Binary/ { print; next }
+              index($0, target) { print }'
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: cinder_replication_services_after
+      when: cinder_replication_verify_services | bool
+
+    - name: Report target backend details after {{ cinder_replication_action }}
+      ansible.builtin.debug:
+        var: cinder_replication_services_after.stdout_lines
+      when: cinder_replication_verify_services | bool
