@@ -643,6 +643,8 @@ class TestAlletrampQos(unittest.TestCase):
     # =========================================================================
 
     @mock.patch('modules.alletramp_qos.AnsibleClient', None)
+    @mock.patch('modules.alletramp_qos.IMPORT_ERROR_MSG',
+                'Python hpe_storage_flowkit_py package is required.')
     @mock.patch('modules.alletramp_qos.AnsibleModule')
     def test_missing_flowkit_package(self, mock_module):
         """

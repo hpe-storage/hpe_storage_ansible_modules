@@ -624,6 +624,26 @@ class TestAlletrampUser(unittest.TestCase):
             changed=True, msg="User created successfully"
         )
 
+    @mock.patch('modules.alletramp_user.AnsibleClient', None)
+    @mock.patch('modules.alletramp_user.IMPORT_ERROR_MSG',
+                'Python hpe_storage_flowkit_py package is required.')
+    @mock.patch('modules.alletramp_user.AnsibleModule')
+    def test_missing_flowkit_package(self, mock_module):
+        """
+        alletramp user - test error when flowkit package is not installed
+        """
+        mock_module.params = self.PARAMS_FOR_CREATE_USER
+        mock_module.return_value = mock_module
+        instance = mock_module.return_value
+        instance.fail_json.side_effect = SystemExit(1)
+
+        with self.assertRaises(SystemExit):
+            user.main()
+
+        instance.fail_json.assert_called_with(
+            msg='Python hpe_storage_flowkit_py package is required.'
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -565,6 +565,8 @@ class TestAlletrampHostset(unittest.TestCase):
     # =========================================================================
 
     @mock.patch('modules.alletramp_hostset.AnsibleClient', None)
+    @mock.patch('modules.alletramp_hostset.IMPORT_ERROR_MSG',
+                'Python hpe_storage_flowkit_py package is required.')
     @mock.patch('modules.alletramp_hostset.AnsibleModule')
     def test_missing_flowkit_package(self, mock_module):
         """

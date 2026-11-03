@@ -1178,6 +1178,8 @@ class TestAlletrampSnapshot(unittest.TestCase):
     # =========================================================================
 
     @mock.patch('modules.alletramp_snapshot.AnsibleClient', None)
+    @mock.patch('modules.alletramp_snapshot.IMPORT_ERROR_MSG',
+                'Python hpe_storage_flowkit_py package is required.')
     @mock.patch('modules.alletramp_snapshot.AnsibleModule')
     def test_missing_flowkit_package(self, mock_module):
         """
@@ -1192,7 +1194,7 @@ class TestAlletrampSnapshot(unittest.TestCase):
             snapshot.main()
 
         instance.fail_json.assert_called_with(
-            msg='the python hpe_storage_flowkit_py module is required'
+            msg='Python hpe_storage_flowkit_py package is required.'
         )
 
 

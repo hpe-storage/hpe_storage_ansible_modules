@@ -175,6 +175,10 @@ class TestAlletrampAlert(unittest.TestCase):
 
     # ---- Module arguments test ----
 
+    # Constants come from flowkit; pin them so the expected spec holds with or without it installed.
+    @mock.patch('modules.alletramp_alert.ALERT_TYPES', fields['alert_type']['choices'])
+    @mock.patch('modules.alletramp_alert.ALERT_SEVERITIES', fields['severity']['choices'])
+    @mock.patch('modules.alletramp_alert.ALERT_STATUSES', fields['alert_status']['choices'])
     @mock.patch('modules.alletramp_alert.AnsibleClient')
     @mock.patch('modules.alletramp_alert.AnsibleModule')
     def test_module_args(self, mock_module, mock_client):
@@ -543,27 +547,28 @@ class TestAlletrampAlert(unittest.TestCase):
         self.assertEqual(instance.exit_json.call_count, 0)
         instance.fail_json.assert_called_with(msg="Test alert generation failed | API error")
 
-    # ---- Flowkit import failure test ----
+    # ---- Recorded import-error reporting test ----
 
-    @mock.patch('modules.alletramp_alert.AnsibleClient')
+    @mock.patch('modules.alletramp_alert.IMPORT_ERROR_MSG',
+                'Python hpe_storage_flowkit_py package is required.')
+    @mock.patch('modules.alletramp_alert.AnsibleClient', None)
     @mock.patch('modules.alletramp_alert.AnsibleModule')
-    def test_flowkit_import_failure(self, mock_module, mock_client):
+    def test_import_guard_reports_recorded_flowkit_error(self, mock_module):
         """
-        alletramp alert - test flowkit import failure
+        Report the recorded Flowkit error when the client is unavailable.
         """
-        with mock.patch('modules.alletramp_alert.AnsibleClient', None):
-            mock_module.params = self.PARAMS_FOR_GET_ALL
-            mock_module.return_value = mock_module
-            instance = mock_module.return_value
-            # Make fail_json raise SystemExit to stop execution like real Ansible
-            instance.fail_json.side_effect = SystemExit(1)
+        mock_module.params = self.PARAMS_FOR_GET_ALL
+        mock_module.return_value = mock_module
+        instance = mock_module.return_value
+        # Make fail_json raise SystemExit to stop execution like real Ansible
+        instance.fail_json.side_effect = SystemExit(1)
 
-            with self.assertRaises(SystemExit):
-                alert.main()
+        with self.assertRaises(SystemExit):
+            alert.main()
 
-            instance.fail_json.assert_called_with(
-                msg='Python hpe_storage_flowkit_py package is required.'
-            )
+        instance.fail_json.assert_called_once_with(
+            msg='Python hpe_storage_flowkit_py package is required.'
+        )
 
     # ---- Client initialization exception test ----
 

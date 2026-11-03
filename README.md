@@ -241,6 +241,16 @@ python3 -m pytest -vv -s
 python3 -m pytest test/test_alletramp_volume.py -vv -s
 ```
 
+### Run Import-Error Regression Tests
+
+These tests simulate missing Flowkit and service imports without loading Flowkit.
+They verify dependency error messages, propagation of non-import exceptions, and
+alert argument validation.
+
+```bash
+python3 -m pytest test/test_import_errors.py -vv
+```
+
 ### Run a Specific Test
 
 ```bash

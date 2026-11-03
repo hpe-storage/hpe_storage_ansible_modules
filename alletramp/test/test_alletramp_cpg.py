@@ -518,6 +518,8 @@ class TestAlletrampCpg(unittest.TestCase):
     # =========================================================================
 
     @mock.patch('modules.alletramp_cpg.AnsibleClient', None)
+    @mock.patch('modules.alletramp_cpg.IMPORT_ERROR_MSG',
+                'Python hpe_storage_flowkit_py package is required.')
     @mock.patch('modules.alletramp_cpg.AnsibleModule')
     def test_missing_flowkit_package(self, mock_module):
         """

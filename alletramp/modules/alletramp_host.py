@@ -16,10 +16,20 @@
 #    under the License.
 #
 from ansible.module_utils.basic import AnsibleModule
+
+FLOWKIT_IMPORT_ERROR = "Python hpe_storage_flowkit_py package is required."
+ANSIBLE_SERVICE_IMPORT_ERROR = "Failed to import AnsibleClient from ansible_service."
+
 try:
     from ansible_service import AnsibleClient
-except ImportError:
+    IMPORT_ERROR_MSG = None
+except ImportError as import_error:
     AnsibleClient = None
+    missing_module = getattr(import_error, "name", "") or ""
+    if missing_module.startswith("hpe_storage_flowkit_py") or "hpe_storage_flowkit_py" in str(import_error):
+        IMPORT_ERROR_MSG = FLOWKIT_IMPORT_ERROR
+    else:
+        IMPORT_ERROR_MSG = ANSIBLE_SERVICE_IMPORT_ERROR
 
 
 
@@ -70,7 +80,7 @@ def main():
 
 
     if AnsibleClient is None:
-        module.fail_json(msg="Failed to import AnsibleClient from ansible_service.")
+        module.fail_json(msg=IMPORT_ERROR_MSG or ANSIBLE_SERVICE_IMPORT_ERROR)
     flowkit_client = AnsibleClient(storage_system_ip, storage_system_username, storage_system_password)
 
     # Dispatch operations (functions exit/fail directly)
