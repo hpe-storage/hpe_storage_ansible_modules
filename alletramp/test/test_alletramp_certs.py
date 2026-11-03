@@ -157,97 +157,95 @@ class TestAlletrampCerts(unittest.TestCase):
         'country': None
     }
 
+    def _mock_module(self, mock_module, params):
+        mock_module.params = params
+        mock_module.return_value = mock_module
+        return mock_module.return_value
+
     @mock.patch('modules.alletramp_certs.AnsibleClient')
-    def test_create_selfsigned_certificate_success(self, mock_flowkit_client):
-        # Setup
+    @mock.patch('modules.alletramp_certs.AnsibleModule')
+    def test_create_selfsigned_certificate_success(self, mock_module, mock_flowkit_client):
+        instance = self._mock_module(mock_module, self.PARAMS_FOR_CREATE_SELFSIGNED_CERT)
         mock_flowkit_client.return_value.create_certificate.return_value = (True, True, "Certificate created successfully", {})
-        
-        # Test with valid selfsigned certificate creation parameters
-        with mock.patch.object(ansible, "exit_json") as exit_json_mock:
-            with mock.patch.object(ansible, "params", self.PARAMS_FOR_CREATE_SELFSIGNED_CERT):
-                certs.main()
-                exit_json_mock.assert_called_with(changed=True, msg="Certificate created successfully")
+
+        certs.main()
+
+        instance.exit_json.assert_called_with(changed=True, msg="Certificate created successfully")
 
     @mock.patch('modules.alletramp_certs.AnsibleClient')
-    def test_create_csr_certificate_success(self, mock_flowkit_client):
-        # Setup
+    @mock.patch('modules.alletramp_certs.AnsibleModule')
+    def test_create_csr_certificate_success(self, mock_module, mock_flowkit_client):
+        instance = self._mock_module(mock_module, self.PARAMS_FOR_CREATE_CSR_CERT)
         mock_flowkit_client.return_value.create_certificate.return_value = (True, True, "CSR created successfully", {})
-        
-        # Test with valid CSR creation parameters
-        with mock.patch.object(ansible, "exit_json") as exit_json_mock:
-            with mock.patch.object(ansible, "params", self.PARAMS_FOR_CREATE_CSR_CERT):
-                certs.main()
-                exit_json_mock.assert_called_with(changed=True, msg="CSR created successfully")
+
+        certs.main()
+
+        instance.exit_json.assert_called_with(changed=True, msg="CSR created successfully")
 
     @mock.patch('modules.alletramp_certs.AnsibleClient')
-    def test_import_certificate_success(self, mock_flowkit_client):
-        # Setup
+    @mock.patch('modules.alletramp_certs.AnsibleModule')
+    def test_import_certificate_success(self, mock_module, mock_flowkit_client):
+        instance = self._mock_module(mock_module, self.PARAMS_FOR_IMPORT_CERT)
         mock_flowkit_client.return_value.create_certificate.return_value = (True, True, "Certificate imported successfully", {})
-        
-        # Test with valid import parameters (import is a create operation)
-        with mock.patch.object(ansible, "exit_json") as exit_json_mock:
-            with mock.patch.object(ansible, "params", self.PARAMS_FOR_IMPORT_CERT):
-                certs.main()
-                exit_json_mock.assert_called_with(changed=True, msg="Certificate imported successfully")
+
+        certs.main()
+
+        instance.exit_json.assert_called_with(changed=True, msg="Certificate imported successfully")
 
     @mock.patch('modules.alletramp_certs.AnsibleClient')
-    def test_get_all_certificates_success(self, mock_flowkit_client):
-        # Setup
+    @mock.patch('modules.alletramp_certs.AnsibleModule')
+    def test_get_all_certificates_success(self, mock_module, mock_flowkit_client):
+        instance = self._mock_module(mock_module, self.PARAMS_FOR_GET_ALL_CERTS)
         mock_flowkit_client.return_value.get_all_certificates.return_value = (True, False, "All certificates retrieved successfully", {"response": []})
-        
-        # Test getting all certificates
-        with mock.patch.object(ansible, "exit_json") as exit_json_mock:
-            with mock.patch.object(ansible, "params", self.PARAMS_FOR_GET_ALL_CERTS):
-                certs.main()
-                exit_json_mock.assert_called_with(changed=False, msg="All certificates retrieved successfully", certificates=[])
+
+        certs.main()
+
+        instance.exit_json.assert_called_with(changed=False, msg="All certificates retrieved successfully", certificates=[])
 
     @mock.patch('modules.alletramp_certs.AnsibleClient')
-    def test_get_certificate_success(self, mock_flowkit_client):
-        # Setup
+    @mock.patch('modules.alletramp_certs.AnsibleModule')
+    def test_get_certificate_success(self, mock_module, mock_flowkit_client):
+        instance = self._mock_module(mock_module, self.PARAMS_FOR_GET_CERT)
         mock_flowkit_client.return_value.get_certificate_by_name.return_value = (True, False, "Certificate retrieved successfully", {"response": {"uid": "123"}})
-        
-        # Test getting certificate by name
-        with mock.patch.object(ansible, "exit_json") as exit_json_mock:
-            with mock.patch.object(ansible, "params", self.PARAMS_FOR_GET_CERT):
-                certs.main()
-                exit_json_mock.assert_called_with(changed=False, msg="Certificate retrieved successfully", certificate_info={"uid": "123"})
+
+        certs.main()
+
+        instance.exit_json.assert_called_with(changed=False, msg="Certificate retrieved successfully", certificate_info={"uid": "123"})
 
     @mock.patch('modules.alletramp_certs.AnsibleClient')
-    def test_delete_certificate_success(self, mock_flowkit_client):
-        # Setup
+    @mock.patch('modules.alletramp_certs.AnsibleModule')
+    def test_delete_certificate_success(self, mock_module, mock_flowkit_client):
+        instance = self._mock_module(mock_module, self.PARAMS_FOR_DELETE_CERT)
         mock_flowkit_client.return_value.delete_certificate_by_name.return_value = (True, True, "Certificate deleted successfully", {})
-        
-        # Test certificate deletion by name
-        with mock.patch.object(ansible, "exit_json") as exit_json_mock:
-            with mock.patch.object(ansible, "params", self.PARAMS_FOR_DELETE_CERT):
-                certs.main()
-                exit_json_mock.assert_called_with(changed=True, msg="Certificate deleted successfully")
+
+        certs.main()
+
+        instance.exit_json.assert_called_with(changed=True, msg="Certificate deleted successfully")
 
     @mock.patch('modules.alletramp_certs.AnsibleClient')
-    def test_patch_certificate_success(self, mock_flowkit_client):
-        # Setup
+    @mock.patch('modules.alletramp_certs.AnsibleModule')
+    def test_patch_certificate_success(self, mock_module, mock_flowkit_client):
+        instance = self._mock_module(mock_module, self.PARAMS_FOR_PATCH_CERT)
         mock_flowkit_client.return_value.patch_certificate_by_name.return_value = (True, True, "Certificate patched successfully", {})
-        
-        # Test certificate patching by name (finish CSR)
-        with mock.patch.object(ansible, "exit_json") as exit_json_mock:
-            with mock.patch.object(ansible, "params", self.PARAMS_FOR_PATCH_CERT):
-                certs.main()
-                exit_json_mock.assert_called_with(changed=True, msg="Certificate patched successfully")
+
+        certs.main()
+
+        instance.exit_json.assert_called_with(changed=True, msg="Certificate patched successfully")
 
     @mock.patch('modules.alletramp_certs.AnsibleClient')
-    def test_create_certificate_failure(self, mock_flowkit_client):
-        # Setup
+    @mock.patch('modules.alletramp_certs.AnsibleModule')
+    def test_create_certificate_failure(self, mock_module, mock_flowkit_client):
+        instance = self._mock_module(mock_module, self.PARAMS_FOR_CREATE_SELFSIGNED_CERT)
         mock_flowkit_client.return_value.create_certificate.return_value = (False, False, "Certificate creation failed | Error message", {})
-        
-        # Test certificate creation failure
-        with mock.patch.object(ansible, "fail_json") as fail_json_mock:
-            with mock.patch.object(ansible, "params", self.PARAMS_FOR_CREATE_SELFSIGNED_CERT):
-                certs.main()
-                fail_json_mock.assert_called_with(msg="Certificate creation failed | Error message")
+
+        certs.main()
+
+        instance.fail_json.assert_called_with(msg="Certificate creation failed | Error message")
 
     @mock.patch('modules.alletramp_certs.AnsibleClient')
-    def test_get_all_certificates_members_response_is_flattened(self, mock_flowkit_client):
-        # Setup
+    @mock.patch('modules.alletramp_certs.AnsibleModule')
+    def test_get_all_certificates_members_response_is_flattened(self, mock_module, mock_flowkit_client):
+        instance = self._mock_module(mock_module, self.PARAMS_FOR_GET_ALL_CERTS)
         mock_flowkit_client.return_value.get_all_certificates.return_value = (
             True,
             False,
@@ -255,14 +253,27 @@ class TestAlletrampCerts(unittest.TestCase):
             {"response": {"members": {"cert1": {"uid": "1"}, "cert2": {"uid": "2"}}}},
         )
 
-        with mock.patch.object(ansible, "exit_json") as exit_json_mock:
-            with mock.patch.object(ansible, "params", self.PARAMS_FOR_GET_ALL_CERTS):
-                certs.main()
-                exit_json_mock.assert_called_with(
-                    changed=False,
-                    msg="All certificates retrieved successfully",
-                    certificates=[{"uid": "1"}, {"uid": "2"}],
-                )
+        certs.main()
+
+        instance.exit_json.assert_called_with(
+            changed=False,
+            msg="All certificates retrieved successfully",
+            certificates=[{"uid": "1"}, {"uid": "2"}],
+        )
+
+    @mock.patch('modules.alletramp_certs.AnsibleClient', None)
+    @mock.patch('modules.alletramp_certs.IMPORT_ERROR_MSG',
+                'Python hpe_storage_flowkit_py package is required.')
+    @mock.patch('modules.alletramp_certs.AnsibleModule')
+    def test_missing_flowkit_package(self, mock_module):
+        instance = self._mock_module(mock_module, self.PARAMS_FOR_GET_ALL_CERTS)
+        instance.fail_json.side_effect = SystemExit(1)
+
+        with self.assertRaises(SystemExit):
+            certs.main()
+
+        instance.fail_json.assert_called_with(msg='Python hpe_storage_flowkit_py package is required.')
+
 
 if __name__ == '__main__':
     unittest.main()

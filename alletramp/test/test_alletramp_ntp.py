@@ -182,6 +182,8 @@ class TestAlletrampNtp(unittest.TestCase):
         )
 
     @mock.patch('modules.alletramp_ntp.AnsibleClient', None)
+    @mock.patch('modules.alletramp_ntp.IMPORT_ERROR_MSG',
+                'Python hpe_storage_flowkit_py package is required.')
     @mock.patch('modules.alletramp_ntp.AnsibleModule')
     def test_flowkit_import_failure(self, mock_module):
         """

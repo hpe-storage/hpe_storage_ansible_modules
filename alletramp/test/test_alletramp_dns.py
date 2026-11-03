@@ -477,6 +477,8 @@ class TestAlletrampDns(unittest.TestCase):
         instance.fail_json.assert_called_with(msg="Connection failed")
 
     @mock.patch('modules.alletramp_dns.AnsibleClient', None)
+    @mock.patch('modules.alletramp_dns.IMPORT_ERROR_MSG',
+                'Python hpe_storage_flowkit_py package is required.')
     @mock.patch('modules.alletramp_dns.AnsibleModule')
     def test_flowkit_import_failure(self, mock_module):
         """

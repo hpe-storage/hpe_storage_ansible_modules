@@ -176,15 +176,45 @@ issue:
 '''
 
 from ansible.module_utils.basic import AnsibleModule
-from hpe_storage_flowkit_py.v3.src.utils.constants import (
-    ALERT_SEVERITIES,
-    ALERT_STATUSES,
-    ALERT_TYPES,
-)
+
+FLOWKIT_IMPORT_ERROR = 'Python hpe_storage_flowkit_py package is required.'
+ANSIBLE_SERVICE_IMPORT_ERROR = 'Failed to import AnsibleClient from ansible_service.'
+
+
+def _classify_import_error(import_error):
+    missing_module = getattr(import_error, 'name', '') or ''
+    if missing_module.startswith('hpe_storage_flowkit_py') or 'hpe_storage_flowkit_py' in str(import_error):
+        return FLOWKIT_IMPORT_ERROR
+    return ANSIBLE_SERVICE_IMPORT_ERROR
+
+
+def _choice_field(valid_choices):
+    # Constants are empty when flowkit is missing; omitting choices lets the import guard report the real error.
+    field = {'type': 'str'}
+    if valid_choices:
+        field['choices'] = list(valid_choices)
+    return field
+
+
 try:
-    from ansible_service import AnsibleClient
-except ImportError:
+    from hpe_storage_flowkit_py.v3.src.utils.constants import (
+        ALERT_SEVERITIES,
+        ALERT_STATUSES,
+        ALERT_TYPES,
+    )
+except ImportError as import_error:
+    ALERT_SEVERITIES = ()
+    ALERT_STATUSES = ()
+    ALERT_TYPES = ()
     AnsibleClient = None
+    IMPORT_ERROR_MSG = _classify_import_error(import_error)
+else:
+    try:
+        from ansible_service import AnsibleClient
+        IMPORT_ERROR_MSG = None
+    except ImportError as import_error:
+        AnsibleClient = None
+        IMPORT_ERROR_MSG = _classify_import_error(import_error)
 
 
 def main():
@@ -197,18 +227,9 @@ def main():
         'storage_system_ip': {'required': True, 'type': 'str'},
         'storage_system_username': {'required': True, 'type': 'str', 'no_log': True},
         'storage_system_password': {'required': True, 'type': 'str', 'no_log': True},
-        'alert_type': {
-            'type': 'str',
-            'choices': list(ALERT_TYPES)
-        },
-        'severity': {
-            'type': 'str',
-            'choices': list(ALERT_SEVERITIES)
-        },
-        'alert_status': {
-            'type': 'str',
-            'choices': list(ALERT_STATUSES)
-        },
+        'alert_type': _choice_field(ALERT_TYPES),
+        'severity': _choice_field(ALERT_SEVERITIES),
+        'alert_status': _choice_field(ALERT_STATUSES),
         'last_days': {'type': 'float'},
         'last_hours': {'type': 'float'},
         'test_message': {'type': 'str'}
@@ -220,7 +241,7 @@ def main():
     )
 
     if AnsibleClient is None:
-        module.fail_json(msg='Failed to import AnsibleClient from ansible_service.')
+        module.fail_json(msg=IMPORT_ERROR_MSG or ANSIBLE_SERVICE_IMPORT_ERROR)
 
     # Get module parameters
     operation = module.params['operation']
