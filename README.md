@@ -431,4 +431,4 @@ cinder list --all-projects --field ID,Name,Status,os-vol-host-attr:host,replicat
 - If `cinder-volume` is restarted while the primary array is unreachable, the driver does not initialize and failover ends in `failover-error`. Restore the primary and restart `cinder-volume` before retrying.
 - A successful backend failover does not guarantee application-level availability.
 
-For the full variable list, driver scenarios, status rules, and troubleshooting, see the [OpenStack Cinder failover/failback README](alletramp/playbooks/openstack_cinder/README.md) and the [automated failover/failback guide](alletramp/playbooks/openstack_cinder/docs/automated-failover-failback.md).
+For the full variable list, driver scenarios, status rules, and troubleshooting, see the [OpenStack Cinder failover/failback README](alletramp/playbooks/openstack_cinder/README.md).
