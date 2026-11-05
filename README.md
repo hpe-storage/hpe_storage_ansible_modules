@@ -22,7 +22,8 @@ These modules enable automation of HPE Alletra MP storage arrays with Ansible.
 4. [Running Unit Tests](#running-unit-tests)
 5. [Getting Started](#getting-started)
 6. [Supported Modules](#supported-modules)
-7. [Module Reference](#module-reference)
+7. [Failover and Failback (OpenStack Cinder)](#failover-and-failback-openstack-cinder)
+8. [Module Reference](#module-reference)
 
 ---
 
@@ -343,3 +344,91 @@ This section provides an overview of all modules available in the HPE Storage An
 | [`alletramp_vlun`](alletramp/modules/readme.md#alletramp_vlun) | Manages VLUN operations for exporting |
 | [`alletramp_volume`](alletramp/modules/readme.md#alletramp_volume) | Manages volume operations |
 | [`alletramp_volumeset`](alletramp/modules/readme.md#alletramp_volumeset) | Manages volume set operations |
+
+---
+
+# Failover and Failback (OpenStack Cinder)
+
+The `alletramp/playbooks/openstack_cinder/` directory contains playbooks that automate Cinder backend failover and failback for replicated HPE Alletra MP backends. They run standalone, without an OpenStack-Ansible checkout, and use the installed `cinder` or `openstack` CLI.
+
+The playbooks do not talk to the storage arrays. They validate the request, issue `cinder failover-host`, and poll the Cinder service record until the backend reaches the expected `replication_status`. The HPE Alletra MP Cinder driver performs the array-side work.
+
+> **Note:** These playbooks depend on the HPE Alletra MP Cinder driver patch [1006944](https://review.opendev.org/c/openstack/cinder/+/1006944).
+
+## Failover and Failback at a Glance
+
+| Item | Failover | Failback |
+|------|----------|----------|
+| Purpose | Move backend to the secondary (DR) array | Return backend to the primary array |
+| Playbook | `cinder-failover.yml` | `cinder-failback.yml` |
+| `backend_id` | Target `replication_device` backend | `default` (always) |
+| Primary array | Available or unavailable | Available and reachable |
+| Expected `replication_status` | `failed-over` | `enabled` |
+
+## Workflow
+
+1. **Preflight and capability check** - validates the action and target, and checks that the deployed driver sets `AUTO_FAILBACK_SUPPORTED`. If not, the run ends as a no-op.
+2. **Service and policy validation** - confirms the target cinder-volume service is `up`, not `failing-over`, and that the `backend_id` is a configured `replication_device`.
+3. **Idempotency check** - ends as a no-op if the backend is already in the requested state.
+4. **Execution and settle polling** - sends the request and polls `replication_status` until it completes, fails, or the settle window ends.
+5. **Verification** - reports the final state of the target backend.
+
+## Prerequisites
+
+- Replication is configured on the backend (`replication_device` is set).
+- Every Peer Persistence remote copy group is started and fully synchronized.
+- For failback, the original primary array is reachable and the DR remote copy groups are in sync.
+- An OpenStack RC file with credentials allowed to list Cinder services and invoke backend failover.
+- The playbook runs on the cinder-volume host, so the driver capability check can import the driver and `cinder.conf` can be read.
+
+No HPE array credentials are required by Ansible.
+
+## Running
+
+Run both commands from `alletramp/playbooks/openstack_cinder/`.
+
+**Failover:**
+
+```bash
+ansible-playbook -i inventories/local-inventory cinder-failover.yml \
+  -e cinder_replication_openrc=/opt/stack/devstack/openrc \
+  -e cinder_replication_target='<host>@<backend>' \
+  -e cinder_replication_backend_id='<replication_device_backend_id>'
+```
+
+**Failback:**
+
+```bash
+ansible-playbook -i inventories/local-inventory cinder-failback.yml \
+  -e cinder_replication_openrc=/opt/stack/devstack/openrc \
+  -e cinder_replication_target='<host>@<backend>'
+```
+
+**Key variables:**
+
+| Variable | Description |
+|----------|-------------|
+| `cinder_replication_target` | Required. The cinder-volume host as `<host>@<backend>`, as shown by `cinder service-list`. |
+| `cinder_replication_backend_id` | Failover only. The `backend_id` of the `replication_device` to fail over to. |
+| `cinder_replication_openrc` | OpenStack RC file to source. Default `$HOME/openrc`. |
+| `cinder_replication_openrc_args` | Arguments for the RC file. DevStack needs `admin admin`. |
+| `cinder_replication_settle_retries` / `cinder_replication_settle_delay` | Status polls (default 24) and seconds between polls (default 5). |
+| `auto_failback_supported` | Set `true` to skip the driver capability check. |
+
+## Verifying the Result
+
+The backend status only shows that the workflow completed. If individual volumes fail, the backend can still end `failed-over` or `enabled` while those volumes show `replication_status` `error`. After every run, check:
+
+```bash
+cinder service-list --withreplication
+cinder list --all-projects --field ID,Name,Status,os-vol-host-attr:host,replication_status
+```
+
+## Limitations
+
+- Supported only for Active-Active Peer Persistence (AAPP) synchronous replication.
+- A request the driver rejects (for example a remote copy group that is not started while the primary is up, or a primary that is still down on failback) leaves the backend unchanged. The failure is reported only after the full settle window.
+- If `cinder-volume` is restarted while the primary array is unreachable, the driver does not initialize and failover ends in `failover-error`. Restore the primary and restart `cinder-volume` before retrying.
+- A successful backend failover does not guarantee application-level availability.
+
+For the full variable list, driver scenarios, status rules, and troubleshooting, see the [OpenStack Cinder failover/failback README](alletramp/playbooks/openstack_cinder/README.md) and the [automated failover/failback guide](alletramp/playbooks/openstack_cinder/docs/automated-failover-failback.md).
